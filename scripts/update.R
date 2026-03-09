@@ -38,13 +38,13 @@ parse_folders <- function(html) {
 
 # --- Helper: parse .tar.gz entries from a subfolder page ---
 parse_entries <- function(html, folder) {
-  # Apache mod_autoindex format:
-  # <a href="PkgName_1.0.0.tar.gz">PkgName_1.0.0.tar.gz</a>  2026-03-09 14:28  616K
+  # Apache mod_autoindex table format:
+  # <td><a href="Pkg_1.0.tar.gz">Pkg_1.0.tar.gz</a></td><td align="right">2026-03-09 14:28  </td>
   # We split by lines and parse each
   lines <- unlist(strsplit(html, "\n"))
 
-  # Pattern: anchor with .tar.gz, then date+time
-  pattern <- '<a href="([^"]+\\.tar\\.gz)">[^<]+</a>\\s+(\\d{4}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2})'
+  # Pattern: anchor with .tar.gz, then non-digit chars (closing tags), then date+time
+  pattern <- '<a href="([^"]+\\.tar\\.gz)">[^<]+</a>[^0-9]*(\\d{4}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2})'
 
   results <- list()
   for (line in lines) {
