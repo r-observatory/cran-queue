@@ -205,21 +205,16 @@ if (nrow(daily_combined) > 0) {
 cat("Daily history:", nrow(daily_final), "rows spanning",
     min(daily_final$date), "to", max(daily_final$date), "\n")
 
-# --- Compute turnaround stats ---
-# For turnaround, we need to process raw data differently.
-# We'll compute approximate stats from the daily data:
-# For each month, sum total packages across all folders.
+# --- Compute monthly stats ---
 cat("Computing queue statistics...\n")
 
-daily_final$month <- substr(daily_final$date, 1, 7)
+stats_df <- daily_final
+stats_df$month <- substr(stats_df$date, 1, 7)
 
 queue_stats <- aggregate(
   package_count ~ month + folder,
-  data = daily_final,
-  FUN = function(x) {
-    # Average daily count for this folder in this month
-    round(mean(x))
-  }
+  data = stats_df,
+  FUN = function(x) round(mean(x))
 )
 names(queue_stats) <- c("month", "folder", "total_packages")
 
@@ -228,9 +223,11 @@ cat("Writing to database...\n")
 con <- dbConnect(SQLite(), db_path)
 dbExecute(con, "PRAGMA journal_mode=WAL")
 
-# Write daily history
+# Write daily history (only date, folder, package_count columns)
 dbExecute(con, "DELETE FROM queue_history_daily")
-dbWriteTable(con, "queue_history_daily", daily_final, append = TRUE)
+dbWriteTable(con, "queue_history_daily",
+             daily_final[, c("date", "folder", "package_count")],
+             append = TRUE)
 cat("Wrote", nrow(daily_final), "rows to queue_history_daily\n")
 
 # Create index
@@ -242,9 +239,6 @@ dbExecute(con, "
   CREATE TABLE queue_stats (
     month TEXT NOT NULL,
     folder TEXT NOT NULL,
-    median_hours REAL,
-    p80_hours REAL,
-    p95_hours REAL,
     total_packages INTEGER,
     PRIMARY KEY (month, folder)
   )
