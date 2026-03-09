@@ -8,9 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: cran-queue-update
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,7 +32,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download latest --pattern "*.db" || echo "No previous release found, starting fresh."
+          gh release download latest --pattern "queue.db" || echo "No previous release found, starting fresh."
 
       - name: Run update script
         run: Rscript scripts/update.R queue.db

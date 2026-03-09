@@ -5,6 +5,8 @@
 
 library(RSQLite)
 
+options(timeout = 60)
+
 # --- Configuration ---
 args <- commandArgs(trailingOnly = TRUE)
 db_path <- if (length(args) >= 1) args[1] else "queue.db"
@@ -90,10 +92,11 @@ parse_entries <- function(html, folder) {
 # --- Main ---
 cat("Connecting to database:", db_path, "\n")
 con <- dbConnect(SQLite(), db_path)
+on.exit(dbDisconnect(con), add = TRUE)
 
 # Set PRAGMAs
 dbExecute(con, "PRAGMA journal_mode=WAL")
-dbExecute(con, "PRAGMA synchronous=OFF")
+dbExecute(con, "PRAGMA synchronous=NORMAL")
 
 # Create queue_snapshots table
 dbExecute(con, "
@@ -142,6 +145,7 @@ for (folder in folders) {
 }
 
 # Combine and insert
+combined <- NULL
 if (length(all_entries) > 0) {
   combined <- do.call(rbind, all_entries)
   combined$snapshot_time <- snapshot_time
@@ -209,5 +213,4 @@ release_notes <- paste0(
 writeLines(release_notes, "release_notes.md")
 cat("Wrote release_notes.md\n")
 
-dbDisconnect(con)
 cat("Done.\n")
