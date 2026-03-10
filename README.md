@@ -1,6 +1,6 @@
 # CRAN Queue Monitor
 
-Automated snapshots of the [CRAN incoming queue](https://cran.r-project.org/incoming/) taken every 2 hours. Each snapshot records every package currently sitting in one of the incoming subfolders (inspect, pending, pretest, publish, recheck, waiting, etc.), capturing how long packages wait before appearing on CRAN.
+Automated snapshots of the [CRAN incoming queue](https://cran.r-project.org/incoming/) taken every hour. Each snapshot records every package currently sitting in one of the incoming subfolders (inspect, pending, pretest, publish, recheck, waiting, etc.), capturing how long packages wait before appearing on CRAN.
 
 The data is stored in a SQLite database (`queue.db`) and published as a GitHub release.
 
@@ -64,7 +64,7 @@ con.close()
 
 ## Update Schedule
 
-The database is updated every 2 hours via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The latest database is always available from the most recent GitHub release.
+The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The latest database is always available from the most recent GitHub release. A `last-updated.txt` file in the repo tracks the last successful run time.
 
 ## License
 
