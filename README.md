@@ -69,3 +69,7 @@ The database is updated every hour via GitHub Actions. Each run scrapes the curr
 ## License
 
 The data is scraped from [CRAN](https://cran.r-project.org/incoming/), which is maintained by the R Foundation. This repository provides the scraping infrastructure and historical snapshots. Please respect CRAN's terms of use.
+
+## Feedback
+
+Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.
