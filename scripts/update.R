@@ -7,6 +7,16 @@ library(RSQLite)
 
 options(timeout = 60)
 
+# Source the pure helpers (sha256 / integrity core / manifest writer). Resolve
+# scripts/ from this file's own path so it works whether invoked as
+# `Rscript scripts/update.R` from the repo root or from elsewhere.
+.script_dir <- tryCatch({
+  a <- commandArgs(FALSE)
+  f <- sub("^--file=", "", grep("^--file=", a, value = TRUE))
+  if (length(f) == 1L && nzchar(f)) dirname(normalizePath(f)) else "scripts"
+}, error = function(e) "scripts")
+source(file.path(.script_dir, "helpers.R"))
+
 # --- Configuration ---
 args <- commandArgs(trailingOnly = TRUE)
 db_path <- if (length(args) >= 1) args[1] else "queue.db"
@@ -92,7 +102,6 @@ parse_entries <- function(html, folder) {
 # --- Main ---
 cat("Connecting to database:", db_path, "\n")
 con <- dbConnect(SQLite(), db_path)
-on.exit(dbDisconnect(con), add = TRUE)
 
 # Set PRAGMAs
 dbExecute(con, "PRAGMA journal_mode=WAL")
@@ -212,5 +221,25 @@ release_notes <- paste0(
 
 writeLines(release_notes, "release_notes.md")
 cat("Wrote release_notes.md\n")
+
+# --- Finalize the database and write the integrity manifest ---
+# Checkpoint the WAL back into the main file and close the connection so the
+# manifest hashes the exact on-disk bytes of queue.db, with no open handle,
+# journal, or -wal sidecar skewing the size/sha256.
+dbExecute(con, "PRAGMA wal_checkpoint(TRUNCATE)")
+dbDisconnect(con)
+
+# complete is DERIVED, not hardcoded. queue.db accumulates hourly snapshots plus
+# a one-time historical daily backfill (queue_history_daily) seeded by
+# import-history.R; that backfill is the pipeline's genuine bootstrap state.
+# complete = full-not-partial is therefore derived from the backfill being
+# present. The append-only snapshot stream's recency is reported separately via
+# the manifest generated_at + db_sha256 fingerprint, not via complete.
+complete <- queue_history_complete(db_path)
+core <- summary_integrity_core(db_path, complete = complete)
+manifest_path <- file.path(dirname(db_path), MANIFEST_FILENAME)
+write_manifest(manifest_path, core)
+cat(sprintf("Wrote %s (complete=%s, db_bytes=%.0f)\n",
+            manifest_path, complete, core$db_bytes))
 
 cat("Done.\n")
