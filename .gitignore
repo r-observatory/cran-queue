@@ -1,4 +1,7 @@
 *.db
+*.db-wal
+*.db-shm
+manifest.json
 release_notes.md
 .Rhistory
 .RData
