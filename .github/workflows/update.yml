@@ -39,10 +39,45 @@ jobs:
         run: Rscript tests/testthat.R
 
       - name: Download previous database
+        # queue.db is carried forward in the release asset, so this download IS
+        # the pipeline's state. Treating every failure here as "no previous
+        # release" once cost four months of snapshots: on 2026-07-16 the API
+        # answered 503, the run started from an empty file, re-seeded the
+        # historical backfill and published that as the new latest.
+        #
+        # So resolve the tag first and let the two cases diverge. A repo with no
+        # releases genuinely starts fresh; a repo that HAS a release must come
+        # back with that release's asset or fail loudly, because publishing
+        # without it silently discards everything collected so far.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download --pattern "queue.db" || echo "No previous release found, starting fresh."
+          set -euo pipefail
+          tag="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
+          if [ -z "$tag" ]; then
+            echo "No releases exist yet; starting fresh."
+            exit 0
+          fi
+          echo "Previous release: $tag"
+          for attempt in 1 2 3 4 5; do
+            if gh release download "$tag" --pattern "queue.db" --clobber; then
+              downloaded=1
+              [ "$attempt" -gt 1 ] && echo "downloaded queue.db (attempt $attempt)"
+              break
+            fi
+            echo "attempt ${attempt}/5 failed to download queue.db from ${tag}"
+            [ "$attempt" -lt 5 ] && sleep $((attempt * 10))
+          done
+          if [ "${downloaded:-0}" != "1" ]; then
+            echo "::error::${tag} exists but its queue.db could not be downloaded. Refusing to start from an empty database, which would discard the accumulated snapshots."
+            exit 1
+          fi
+          # An empty or truncated file would reach import-history.R as a fresh
+          # database and re-bootstrap just as a failed download does.
+          if [ ! -s queue.db ]; then
+            echo "::error::downloaded queue.db from ${tag} is empty"
+            exit 1
+          fi
 
       - name: Import historical data (if needed)
         run: Rscript scripts/import-history.R queue.db
