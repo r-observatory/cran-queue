@@ -268,9 +268,32 @@ cat(sprintf("Retention OK: %d snapshots from %s, %d days of history from %s\n",
             coverage$queue_snapshots$rows, coverage$queue_snapshots$min,
             coverage$queue_history_daily$dates, coverage$queue_history_daily$min))
 
+
+# --- Build the published asset, and refuse to publish one that cannot upload ---
+# Compressing is what lets the history keep growing without ever being trimmed
+# to fit: the database is about nine times its compressed size, and a release
+# goes out every hour.
+zst_path <- compress_asset(db_path)
+asset_sizes <- c(file.size(db_path), file.size(zst_path))
+names(asset_sizes) <- c(basename(db_path), basename(zst_path))
+cat(sprintf("Asset: %s %.1f MB -> %s %.1f MB (%.1fx smaller)\n",
+            basename(db_path), asset_sizes[[1]] / 1024^2,
+            basename(zst_path), asset_sizes[[2]] / 1024^2,
+            asset_sizes[[1]] / asset_sizes[[2]]))
+
+oversized <- asset_size_violations(asset_sizes)
+if (length(oversized) > 0) {
+  cat("\nRefusing to publish: an asset would be rejected by the release-asset cap.\n")
+  for (v in oversized) cat("  -", v, "\n")
+  cat("Trimming history to fit is not the answer; change what the release carries.\n")
+  stop("release asset too large")
+}
+for (w in asset_size_warnings(asset_sizes)) cat("NOTE:", w, "\n")
+
 complete <- queue_history_complete(db_path)
 core <- summary_integrity_core(db_path, complete = complete)
 core$coverage <- coverage
+core <- c(core, compressed_asset_core(zst_path))
 manifest_path <- file.path(dirname(db_path), MANIFEST_FILENAME)
 write_manifest(manifest_path, core)
 cat(sprintf("Wrote %s (complete=%s, db_bytes=%.0f)\n",

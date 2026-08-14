@@ -140,6 +140,70 @@ retention_violations <- function(now, prior) {
   out
 }
 
+# GitHub hard-caps a single release asset at 2 GiB. The merger guards its own
+# asset against the same number (data/.github/workflows/merge.yml), so the two
+# pipelines fail on the same boundary rather than each discovering it their own
+# way.
+RELEASE_ASSET_MAX_BYTES <- 2040109465
+# Fraction of the cap at which an asset starts saying so. A guard that only
+# fires AT the cap reports the problem on the day collection stops, which is far
+# too late to change the asset layout.
+RELEASE_ASSET_WARN_AT <- 0.8
+
+#' Compress a finalized database into the asset that actually gets published.
+#'
+#' queue.db is roughly nine times its compressed size, and a release is published
+#' every hour, so the uncompressed asset is both the thing that will eventually
+#' meet the 2 GiB cap and a standing contributor to the pile of superseded
+#' release assets. Compressing is what lets the history keep growing without ever
+#' having to be trimmed to fit.
+#'
+#' Returns the path to the compressed file.
+compress_asset <- function(db_path, level = 12L) {
+  stopifnot(file.exists(db_path))
+  if (!nzchar(Sys.which("zstd"))) stop("zstd not found; cannot build the release asset")
+  zst <- paste0(db_path, ".zst")
+  status <- system2("zstd", c(sprintf("-%d", level), "-q", "-f", "-T0",
+                              shQuote(db_path), "-o", shQuote(zst)))
+  if (!identical(status, 0L) || !file.exists(zst)) stop("zstd failed to compress ", db_path)
+  zst
+}
+
+#' Manifest fields describing the compressed asset a consumer actually downloads.
+#'
+#' summary_integrity_core() describes the DATABASE. A consumer pulling the
+#' compressed asset can only verify these bytes before decompressing, so the
+#' asset gets its own size and hash rather than being taken on trust.
+compressed_asset_core <- function(zst_path) {
+  stopifnot(file.exists(zst_path))
+  list(
+    asset_filename = basename(zst_path),
+    asset_bytes    = file.size(zst_path),
+    asset_sha256   = file_sha256(zst_path)
+  )
+}
+
+#' Assets that would be refused by the release-asset cap.
+#'
+#' `sizes` is a named vector of bytes keyed by filename. Returns a character
+#' vector of violations, empty when every asset fits.
+asset_size_violations <- function(sizes, max_bytes = RELEASE_ASSET_MAX_BYTES,
+                                  warn_at = RELEASE_ASSET_WARN_AT) {
+  over <- sizes[sizes > max_bytes]
+  if (length(over) == 0L) return(character(0))
+  sprintf("%s is %.0f bytes, over the %.0f-byte release-asset cap",
+          names(over), as.numeric(over), max_bytes)
+}
+
+#' Assets close enough to the cap to be worth acting on before they hit it.
+asset_size_warnings <- function(sizes, max_bytes = RELEASE_ASSET_MAX_BYTES,
+                                warn_at = RELEASE_ASSET_WARN_AT) {
+  near <- sizes[sizes > max_bytes * warn_at & sizes <= max_bytes]
+  if (length(near) == 0L) return(character(0))
+  sprintf("%s is at %.0f%% of the release-asset cap (%.0f of %.0f bytes)",
+          names(near), 100 * as.numeric(near) / max_bytes, as.numeric(near), max_bytes)
+}
+
 #' Build the integrity / completeness core describing a finalized SQLite file.
 #'
 #' Returns a named list of TOP-LEVEL manifest fields computed from the exact
