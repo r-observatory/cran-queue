@@ -23,6 +23,22 @@ db_path <- if (length(args) >= 1) args[1] else "queue.db"
 
 cran_incoming_url <- "https://cran.r-project.org/incoming/"
 
+# The previous release's manifest, read before anything here overwrites it. It
+# is what this run gets measured against before it is allowed to publish: the
+# database travels in the release asset, so a run that ships less than it
+# started from cuts that history off for every consumer, permanently.
+prior_manifest_path <- file.path(dirname(db_path), MANIFEST_FILENAME)
+prior_manifest <- if (file.exists(prior_manifest_path)) {
+  tryCatch(jsonlite::fromJSON(prior_manifest_path, simplifyVector = FALSE),
+           error = function(e) {
+             cat("Previous manifest could not be parsed:", conditionMessage(e), "\n")
+             NULL
+           })
+} else {
+  cat("No previous manifest alongside the database; nothing to compare against.\n")
+  NULL
+}
+
 # --- Helper: fetch page content ---
 fetch_page <- function(url) {
   con <- url(url, "r")
@@ -250,8 +266,26 @@ dbDisconnect(con)
 # complete = full-not-partial is therefore derived from the backfill being
 # present. The append-only snapshot stream's recency is reported separately via
 # the manifest generated_at + db_sha256 fingerprint, not via complete.
+
+# --- Refuse to publish a database that lost history ---
+# The check sits here, after the file is finalized and before the release step
+# can run, because a green run that quietly shipped less than it received is the
+# failure this pipeline has actually had.
+coverage <- queue_coverage(db_path)
+violations <- retention_violations(coverage, prior_manifest)
+if (length(violations) > 0) {
+  cat("\nRefusing to publish: this run would drop history the last release had.\n")
+  for (v in violations) cat("  -", v, "\n")
+  cat("The previous release still holds it. Do not re-run until the cause is known.\n")
+  stop("retention check failed")
+}
+cat(sprintf("Retention OK: %d snapshots from %s, %d days of history from %s\n",
+            coverage$queue_snapshots$rows, coverage$queue_snapshots$min,
+            coverage$queue_history_daily$dates, coverage$queue_history_daily$min))
+
 complete <- queue_history_complete(db_path)
 core <- summary_integrity_core(db_path, complete = complete)
+core$coverage <- coverage
 manifest_path <- file.path(dirname(db_path), MANIFEST_FILENAME)
 write_manifest(manifest_path, core)
 cat(sprintf("Wrote %s (complete=%s, db_bytes=%.0f)\n",

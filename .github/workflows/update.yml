@@ -78,6 +78,12 @@ jobs:
             echo "::error::downloaded queue.db from ${tag} is empty"
             exit 1
           fi
+          # The manifest states what that release contained, and update.R holds
+          # this run to it before publishing. Releases predating the manifest do
+          # not have one, so its absence is not an error; a run with nothing to
+          # compare against says so and carries on.
+          gh release download "$tag" --pattern "manifest.json" --clobber \
+            || echo "::warning::${tag} has no manifest.json; this run cannot be checked against it"
 
       - name: Import historical data (if needed)
         run: Rscript scripts/import-history.R queue.db
