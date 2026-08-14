@@ -64,6 +64,82 @@ queue_history_complete <- function(db_path, min_rows = HISTORY_BOOTSTRAP_MIN) {
   isTRUE(n > min_rows)
 }
 
+#' How far back each accumulating table reaches, not just how big it is.
+#'
+#' Recorded in the manifest so the NEXT run can check it did not lose anything.
+#' Row counts alone are not enough: a snapshot window that slid forward keeps its
+#' count while losing its earliest months.
+queue_coverage <- function(db_path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  s <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n, MIN(snapshot_time) AS lo,
+                                    MAX(snapshot_time) AS hi FROM queue_snapshots")
+  h <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n, COUNT(DISTINCT date) AS d,
+                                    MIN(date) AS lo, MAX(date) AS hi FROM queue_history_daily")
+  list(
+    queue_snapshots     = list(rows = as.integer(s$n), min = s$lo, max = s$hi),
+    queue_history_daily = list(rows = as.integer(h$n), dates = as.integer(h$d),
+                               min = h$lo, max = h$hi)
+  )
+}
+
+#' What this run would destroy relative to the release it started from.
+#'
+#' queue.db lives in the release asset, so each run's output is the next run's
+#' input: a run that publishes less than it started with cuts that history off
+#' for everyone downstream, permanently. On 2026-07-16 a transient API failure
+#' did exactly that, dropped 323,063 snapshots, and stayed green, because
+#' nothing compared the two.
+#'
+#' The two tables get different invariants on purpose. queue_snapshots is
+#' append-only, so both its row count and its earliest row must hold. The daily
+#' history is derived and MAY legitimately shed rows, because rolling a day up
+#' from our own snapshots can record fewer folders than the cransays backfill
+#' did for that same day; what must hold there is the DAYS covered, and the
+#' earliest of them, which is what carries the pre-scraper years.
+#'
+#' `prior` is the previous release's parsed manifest.json, or NULL for a genuine
+#' cold start. Manifests published before this existed carry `tables` but no
+#' `coverage`, so the snapshot count falls back to that rather than passing
+#' vacuously on precisely the releases it most needs to compare against.
+#'
+#' Returns a character vector of violations, empty when the run retains
+#' everything.
+retention_violations <- function(now, prior) {
+  if (is.null(prior)) return(character(0))
+  out <- character(0)
+  usable <- function(x) !is.null(x) && length(x) == 1L && !is.na(x)
+
+  snap_rows <- prior$coverage$queue_snapshots$rows
+  if (!usable(snap_rows)) snap_rows <- prior$tables$queue_snapshots
+  if (usable(snap_rows) && now$queue_snapshots$rows < as.integer(snap_rows)) {
+    out <- c(out, sprintf("queue_snapshots fell from %d rows to %d",
+                          as.integer(snap_rows), now$queue_snapshots$rows))
+  }
+
+  snap_min <- prior$coverage$queue_snapshots$min
+  if (usable(snap_min) && usable(now$queue_snapshots$min) &&
+      now$queue_snapshots$min > snap_min) {
+    out <- c(out, sprintf("the earliest snapshot moved forward from %s to %s",
+                          snap_min, now$queue_snapshots$min))
+  }
+
+  days <- prior$coverage$queue_history_daily$dates
+  if (usable(days) && now$queue_history_daily$dates < as.integer(days)) {
+    out <- c(out, sprintf("queue_history_daily fell from %d days to %d",
+                          as.integer(days), now$queue_history_daily$dates))
+  }
+
+  day_min <- prior$coverage$queue_history_daily$min
+  if (usable(day_min) && usable(now$queue_history_daily$min) &&
+      now$queue_history_daily$min > day_min) {
+    out <- c(out, sprintf("the earliest day in queue_history_daily moved forward from %s to %s",
+                          day_min, now$queue_history_daily$min))
+  }
+
+  out
+}
+
 #' Build the integrity / completeness core describing a finalized SQLite file.
 #'
 #' Returns a named list of TOP-LEVEL manifest fields computed from the exact
