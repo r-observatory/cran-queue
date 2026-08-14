@@ -165,6 +165,21 @@ if (length(all_entries) > 0) {
   cat("No entries found across all folders\n")
 }
 
+# --- Roll the snapshots up into the daily history ---
+# import-history.R seeds this table once from cransays and then skips itself
+# forever, so without this step the series the site charts stops on the day of
+# that bootstrap while the snapshot stream carries on past it.
+dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS queue_history_daily (
+    date TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    package_count INTEGER NOT NULL,
+    PRIMARY KEY (date, folder)
+  )
+")
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_qhd_date ON queue_history_daily(date)")
+cat("Rolled up", roll_up_daily_history(con), "daily history rows\n")
+
 # --- Compute queue_stats ---
 dbExecute(con, "DROP TABLE IF EXISTS queue_stats")
 dbExecute(con, "
