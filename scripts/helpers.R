@@ -64,6 +64,61 @@ queue_history_complete <- function(db_path, min_rows = HISTORY_BOOTSTRAP_MIN) {
   isTRUE(n > min_rows)
 }
 
+# The folder vocabulary queue_history_daily has carried since the cransays
+# backfill. CRAN's incoming area also holds a folder per reviewer, named for
+# that reviewer's initials, and the backfill files all of those under "human".
+# Anything outside this set is therefore a reviewer and collapses the same way;
+# left unmapped, every reviewer would open their own series on the queue chart.
+QUEUE_FOLDERS <- c("newbies", "inspect", "pending", "waiting",
+                   "pretest", "recheck", "publish", "archive")
+
+#' Roll the hourly snapshot stream up into one row per (day, folder).
+#'
+#' queue_history_daily is what the site's queue chart reads. It was seeded once
+#' by scripts/import-history.R from r-hub/cransays and, until this existed,
+#' nothing ever added to it, so the chart's last point stayed frozen on the day
+#' of the last bootstrap while the snapshot stream ran on without it.
+#'
+#' Only the days the snapshot stream actually covers are rewritten. The backfill
+#' reaches back to 2020 and we hold no snapshots for those years, so rebuilding
+#' the whole table would throw them away.
+#'
+#' A day is counted from its LAST snapshot. Every run re-lists the entire queue,
+#' so summing a day's snapshots would multiply the queue by the number of runs
+#' that day. Rewriting the day in progress on every run is also what lets a
+#' folder that has emptied since the morning drop back out of that day's counts,
+#' which a plain upsert would leave behind.
+#'
+#' Returns the number of (day, folder) rows written.
+roll_up_daily_history <- function(con) {
+  folder_slots <- paste(rep("?", length(QUEUE_FOLDERS)), collapse = ", ")
+  rows <- DBI::dbGetQuery(con, sprintf("
+    WITH last_of_day AS (
+      SELECT date(snapshot_time) AS day, MAX(snapshot_time) AS at
+        FROM queue_snapshots
+       GROUP BY date(snapshot_time)
+    )
+    SELECT l.day AS date,
+           CASE WHEN s.folder IN (%s) THEN s.folder ELSE 'human' END AS folder,
+           COUNT(DISTINCT s.package) AS package_count
+      FROM queue_snapshots s
+      JOIN last_of_day l ON s.snapshot_time = l.at
+     GROUP BY 1, 2
+     ORDER BY 1, 2", folder_slots), params = as.list(QUEUE_FOLDERS))
+
+  if (nrow(rows) == 0L) return(0L)
+
+  DBI::dbWithTransaction(con, {
+    days <- unique(rows$date)
+    DBI::dbExecute(con, sprintf(
+      "DELETE FROM queue_history_daily WHERE date IN (%s)",
+      paste(rep("?", length(days)), collapse = ", ")), params = as.list(days))
+    DBI::dbWriteTable(con, "queue_history_daily", rows, append = TRUE)
+  })
+
+  nrow(rows)
+}
+
 #' Build the integrity / completeness core describing a finalized SQLite file.
 #'
 #' Returns a named list of TOP-LEVEL manifest fields computed from the exact
