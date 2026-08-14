@@ -59,18 +59,42 @@ jobs:
             exit 0
           fi
           echo "Previous release: $tag"
+
+          # A missing asset and a failed download look the same to `gh release
+          # download`, so ask the release what it actually carries before trying
+          # to pull anything. Otherwise a compressed-only release and a network
+          # failure would be indistinguishable, which is the confusion that
+          # caused the 07-16 loss in the first place.
+          assets="$(gh release view "$tag" --json assets -q '.assets[].name' 2>/dev/null || true)"
+          if printf '%s\n' "$assets" | grep -qx 'queue.db.zst'; then
+            want="queue.db.zst"
+          elif printf '%s\n' "$assets" | grep -qx 'queue.db'; then
+            want="queue.db"
+          else
+            echo "::error::${tag} carries neither queue.db.zst nor queue.db (assets: ${assets:-none}). Refusing to start from an empty database."
+            exit 1
+          fi
+          echo "Pulling $want"
+
           for attempt in 1 2 3 4 5; do
-            if gh release download "$tag" --pattern "queue.db" --clobber; then
+            if gh release download "$tag" --pattern "$want" --clobber; then
               downloaded=1
-              [ "$attempt" -gt 1 ] && echo "downloaded queue.db (attempt $attempt)"
+              [ "$attempt" -gt 1 ] && echo "downloaded ${want} (attempt $attempt)"
               break
             fi
-            echo "attempt ${attempt}/5 failed to download queue.db from ${tag}"
+            echo "attempt ${attempt}/5 failed to download ${want} from ${tag}"
             [ "$attempt" -lt 5 ] && sleep $((attempt * 10))
           done
           if [ "${downloaded:-0}" != "1" ]; then
-            echo "::error::${tag} exists but its queue.db could not be downloaded. Refusing to start from an empty database, which would discard the accumulated snapshots."
+            echo "::error::${tag} exists but its ${want} could not be downloaded. Refusing to start from an empty database, which would discard the accumulated snapshots."
             exit 1
+          fi
+
+          if [ "$want" = "queue.db.zst" ]; then
+            command -v zstd >/dev/null || { echo "::error::zstd not found on the runner"; exit 1; }
+            zstd -dq -f queue.db.zst -o queue.db \
+              || { echo "::error::${tag}'s queue.db.zst could not be decompressed"; exit 1; }
+            rm -f queue.db.zst
           fi
           # An empty or truncated file would reach import-history.R as a fresh
           # database and re-bootstrap just as a failed download does.
@@ -96,8 +120,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v$(date -u +'%Y%m%d-%H%M%S')"
+          # Both assets for now. Consumers still pulling queue.db keep working
+          # while they move to queue.db.zst, which is the one that has room to
+          # grow; the plain copy comes out once nothing reads it.
           gh release create "$TAG" \
             queue.db \
+            queue.db.zst \
             manifest.json \
             --title "Queue snapshot $TAG" \
             --notes-file release_notes.md \
