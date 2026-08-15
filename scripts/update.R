@@ -181,6 +181,22 @@ if (length(all_entries) > 0) {
   cat("No entries found across all folders\n")
 }
 
+# --- Record the scrape itself, whatever it found ---
+# An empty queue writes no snapshot rows, so without this a clear queue and a
+# run that never happened look identical afterwards. CRAN's incoming queue drained
+# to single digits in August 2026, so this is not a hypothetical shape.
+dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS queue_scrapes (
+    snapshot_time TEXT PRIMARY KEY,
+    package_count INTEGER NOT NULL
+  )
+")
+# Six years of snapshots predate the table; recover what can be recovered once.
+# Additive, so the empty scrapes it cannot derive are never disturbed.
+backfilled <- backfill_scrapes(con)
+if (backfilled > 0L) cat("Recovered", backfilled, "past scrapes into queue_scrapes\n")
+record_scrape(con, snapshot_time, if (length(all_entries) > 0) nrow(combined) else 0L)
+
 # --- Roll the snapshots up into the daily history ---
 # import-history.R seeds this table once from cransays and then skips itself
 # forever, so without this step the series the site charts stops on the day of
@@ -195,6 +211,27 @@ dbExecute(con, "
 ")
 dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_qhd_date ON queue_history_daily(date)")
 cat("Rolled up", roll_up_daily_history(con), "daily history rows\n")
+
+# --- Roll the snapshots up into one row per submission ---
+# The stream describes moments; every question about a submission (how long did
+# this package+version sit, which folder did it end in) otherwise has to derive
+# the submission list by scanning all 3.55M rows first, 23.0s of a 23.8s query.
+# Only this run's packages are recomputed, 1.5s against the published database
+# where a full rebuild of the table is a minute or more; update_submissions()
+# falls back to that rebuild for the cases where narrowing would be wrong.
+dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS queue_submissions (
+    package TEXT NOT NULL,
+    version TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    submitted_at TEXT,
+    last_folder TEXT NOT NULL,
+    n_observations INTEGER NOT NULL,
+    PRIMARY KEY (package, version)
+  )
+")
+cat("Rewrote", update_submissions(con, snapshot_time), "submission rows\n")
 
 # --- Compute queue_stats ---
 dbExecute(con, "DROP TABLE IF EXISTS queue_stats")

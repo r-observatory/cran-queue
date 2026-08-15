@@ -72,6 +72,89 @@ queue_history_complete <- function(db_path, min_rows = HISTORY_BOOTSTRAP_MIN) {
 QUEUE_FOLDERS <- c("newbies", "inspect", "pending", "waiting",
                    "pretest", "recheck", "publish", "archive")
 
+#' Record that a scrape happened, and what it found.
+#'
+#' queue_snapshots holds one row per package per scrape, so a scrape that found
+#' an empty queue writes nothing and afterwards cannot be told apart from a
+#' scrape that never ran: both have no rows for that moment. That distinction
+#' matters to any reading of the series, because a day with no bar should mean
+#' "we were not looking" and a day with a zero bar should mean "the queue was
+#' clear", and today both render as the day simply not existing.
+#'
+#' Keyed on the scrape time, so a re-run replaces rather than duplicates.
+record_scrape <- function(con, snapshot_time, package_count) {
+  DBI::dbExecute(con,
+    "INSERT OR REPLACE INTO queue_scrapes (snapshot_time, package_count) VALUES (?, ?)",
+    params = list(as.character(snapshot_time), as.integer(package_count)))
+  invisible(NULL)
+}
+
+#' Reconstruct the scrape record from the snapshots already stored.
+#'
+#' Six years of snapshots predate this table. Every scrape that found anything
+#' can be recovered from them exactly, since each carries its own timestamp.
+#'
+#' Deliberately additive: a scrape already recorded is left alone. Rebuilding the
+#' table from queue_snapshots instead would erase every empty scrape, which is
+#' precisely the row this table exists to hold and the one that cannot be derived
+#' from snapshots at all.
+#'
+#' Returns the number of scrapes recorded.
+backfill_scrapes <- function(con) {
+  n <- DBI::dbExecute(con, "
+    INSERT OR IGNORE INTO queue_scrapes (snapshot_time, package_count)
+      SELECT snapshot_time, COUNT(*) FROM queue_snapshots GROUP BY snapshot_time")
+  as.integer(n)
+}
+
+#' Which days in a range were observed at all, and how often.
+#'
+#' A day is observed when at least one scrape ran on it, whatever it found. The
+#' caller renders an unobserved day as a break and an observed-but-empty day as a
+#' zero, which are different statements about the queue.
+observed_days <- function(con, from, to) {
+  days <- DBI::dbGetQuery(con, "
+    WITH RECURSIVE cal(d) AS (
+      SELECT date(?1)
+      UNION ALL SELECT date(d, '+1 day') FROM cal WHERE d < date(?2)
+    )
+    SELECT cal.d AS date,
+           (SELECT COUNT(*) FROM queue_scrapes s
+             WHERE date(s.snapshot_time) = cal.d) AS scrapes
+      FROM cal ORDER BY cal.d", params = list(as.character(from), as.character(to)))
+  days$scrapes <- as.integer(days$scrapes)
+  days$observed <- days$scrapes > 0L
+  days
+}
+
+#' Which folder a cransays archive row belongs in, in OUR vocabulary.
+#'
+#' The archive and our own scrape record the same fact differently. cransays
+#' files a package sitting with a named CRAN reviewer as folder "human" with the
+#' reviewer's initials in a separate subfolder column; our scrape has no
+#' subfolder and records those initials as the folder itself. Imported verbatim,
+#' six years of reviewer work would sit under one "human" bucket while our own
+#' months carry the initials, and no query could span the join.
+#'
+#' So a reviewer row takes its identity from the subfolder, and everything else
+#' keeps its folder. Three cases have to be excluded from that rule, all of them
+#' present in the archive:
+#'   * the subfolder repeats the folder name ("newbies"/"newbies"), an
+#'     inconsistency the archive carries throughout;
+#'   * the subfolder is absent, empty, the string "NA", or a bare "/";
+#'   * the subfolder describes the CHECK rather than a person
+#'     ("special/valgrind"), which our scrape does not record at all, so keeping
+#'     the parent folder is what makes the two eras comparable.
+#'
+#' Vectorised: a whole snapshot goes through in one call.
+cransays_folder <- function(folder, subfolder) {
+  folder <- as.character(folder)
+  subfolder <- as.character(subfolder)
+  usable <- !is.na(subfolder) & nzchar(subfolder) & subfolder != "NA" &
+    subfolder != "/" & subfolder != folder & !grepl("/", subfolder, fixed = TRUE)
+  ifelse(folder == "human" & usable, subfolder, folder)
+}
+
 #' Roll the hourly snapshot stream up into one row per (day, folder).
 #'
 #' queue_history_daily is what the site's queue chart reads. It was seeded once
@@ -119,6 +202,219 @@ roll_up_daily_history <- function(con) {
   nrow(rows)
 }
 
+#' Derive one row per submission, for whatever slice of the stream is admitted.
+#'
+#' queue_snapshots answers what the queue looked like at a MOMENT. Every question
+#' about a SUBMISSION (how long did this package+version sit, which folder did it
+#' end in) has to derive the submission list first, and that derivation is the
+#' whole cost: scanning and grouping the 3.55M-row stream is 23.0s of a 23.8s
+#' query that joins the result into CRAN's 162k version table. Reading the same
+#' 82,048 submissions from this table is 0.10s, and it costs 9 MB, less than the
+#' version table such a query is joined against.
+#'
+#' Three normalizations, each because the stream spells one fact several ways:
+#'
+#'   * version. A filename that does not parse into Package_Version.tar.gz has
+#'     no version, and the stream has spelled that NULL, "" and "NA" at different
+#'     times, so all three are handled. In the published database today every one
+#'     of the 684 such rows is a SQL NULL; the other two spellings are carried
+#'     for the older shapes rather than because they are currently present.
+#'     All become "NA" here, so that (package, version) is a
+#'     usable key: a SQLite NULL is never equal to itself in a UNIQUE index, so
+#'     left as NULL those rows would grow a fresh duplicate on every hourly
+#'     update. The cost is that two unparseable submissions of one package
+#'     collapse into a single row; 684 of the stream's 3.55M rows, across 18
+#'     packages, are unparseable at all.
+#'   * submitted_at. CRAN's own submission time, absent on about a fifth of rows
+#'     and spelled NULL, empty, or "NA". Compared as text "NA" sorts below every
+#'     real timestamp and would become the submission time of any package it
+#'     touched, so the absent spellings are dropped and the earliest surviving
+#'     value wins. first_seen sits beside it deliberately: it is only when WE
+#'     first saw the submission, and the consumer picks which start-of-life it
+#'     wants rather than having one chosen here.
+#'   * folder. The same collapse queue_history_daily uses, so a submission last
+#'     seen with a named reviewer reports "human" instead of opening an outcome
+#'     folder per reviewer. That collapse is not only reviewers: the stream also
+#'     carries a few hundred rows filed under check variants (clang14, clang15),
+#'     and those land in "human" as well rather than each becoming an outcome.
+#'
+#' first_seen and last_seen bound the sightings of a (package, version), which is
+#' NOT the same as one stay in the queue. A resubmission of the same version
+#' reuses the key, so the pair can span several separate stints: specmine.datasets
+#' 0.0.2 runs 2021-02-17 to 2026-07-01 on 6 sightings, with 1,959 days of nothing
+#' between two of them. 3,698 of the 82,048 submissions have a gap over 7 days
+#' between consecutive sightings and 1,228 a gap over 30, so last_seen minus
+#' first_seen is calendar distance and not time queued for about 4.5% of rows.
+#' A consumer wanting residency has to split the sightings on the gaps, which
+#' needs the stream; this table says how to find them, not how long they waited.
+#'
+#' n_observations counts SCRAPES rather than rows. A package genuinely sits in
+#' two folders at once, a copy in waiting while another is in recheck, in 11,742
+#' of the stream's package-scrapes; counting rows would report those twice as
+#' time spent queued.
+#'
+#' last_folder is read from the last scrape that saw the submission, and is worth
+#' being exact about rather than approximating: measured against CRAN's version
+#' table downstream, submissions last seen in newbies never land 37% of the time
+#' and those last seen in recheck 2%. For 473 of the 82,048 submissions that last
+#' scrape holds two folders that survive the collapse, so no single answer exists
+#' (474 differ before it: one submission's last scrape holds two reviewer
+#' initials, which both become "human", so that one does have an answer); the
+#' last row recorded
+#' for that moment is taken, which is stable across rebuilds because rowids in
+#' the append-only stream never move, and which invents no ranking between
+#' folders that CRAN does not publish.
+#'
+#' Whether a submission reached CRAN is deliberately not a column here. This
+#' repository holds no CRAN version data, and importing some to answer that would
+#' put the join in the wrong place: package_version_history and cran_names_all
+#' already live downstream, where that flag belongs.
+#'
+#' `where` restricts which snapshot rows are read. Both build paths share this
+#' one query, so the incremental update is the full rebuild narrowed rather than
+#' a second implementation that has to be kept agreeing with it.
+submissions_query <- function(where = "1") {
+  folder_slots <- paste(rep("?", length(QUEUE_FOLDERS)), collapse = ", ")
+  sprintf("
+    WITH observed AS (
+      SELECT s.snapshot_time AS snapshot_time,
+             s.package AS package,
+             COALESCE(NULLIF(s.version, ''), 'NA') AS version,
+             CASE WHEN s.folder IN (%s) THEN s.folder ELSE 'human' END AS folder,
+             NULLIF(NULLIF(s.submitted_at, ''), 'NA') AS submitted_at,
+             s.rowid AS rid
+        FROM queue_snapshots s
+       WHERE %s
+    ),
+    lifetime AS (
+      SELECT package, version,
+             MIN(snapshot_time) AS first_seen,
+             MAX(snapshot_time) AS last_seen,
+             MIN(submitted_at) AS submitted_at,
+             COUNT(DISTINCT snapshot_time) AS n_observations
+        FROM observed
+       GROUP BY package, version
+    ),
+    final_folder AS (
+      SELECT package, version, folder,
+             ROW_NUMBER() OVER (PARTITION BY package, version
+                                    ORDER BY snapshot_time DESC, rid DESC) AS seq
+        FROM observed
+    )
+    INSERT INTO queue_submissions
+      (package, version, first_seen, last_seen, submitted_at, last_folder,
+       n_observations)
+    SELECT l.package, l.version, l.first_seen, l.last_seen, l.submitted_at,
+           f.folder, l.n_observations
+      FROM lifetime l
+      JOIN final_folder f
+        ON f.package = l.package AND f.version = l.version AND f.seq = 1",
+    folder_slots, where)
+}
+
+#' Rebuild every submission from the whole stream.
+#'
+#' 58s over the published database's 3.55M rows with the file already in page
+#' cache and 76s without, and it grows with the stream, so this is not the hourly
+#' path; see update_submissions().
+#'
+#' Returns the number of submissions written.
+rebuild_submissions <- function(con) {
+  # Create rather than assume, so this works on a database that has never held
+  # the table. update.R runs the same DDL first, but the helper is also the
+  # recovery path for any consumer building the table itself, and a rebuild that
+  # only works when the table is already there is not much of a rebuild.
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS queue_submissions (
+      package TEXT NOT NULL,
+      version TEXT NOT NULL,
+      first_seen TEXT NOT NULL,
+      last_seen TEXT NOT NULL,
+      submitted_at TEXT,
+      last_folder TEXT NOT NULL,
+      n_observations INTEGER NOT NULL,
+      PRIMARY KEY (package, version)
+    )")
+  n <- DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, "DELETE FROM queue_submissions")
+    DBI::dbExecute(con, submissions_query(), params = as.list(QUEUE_FOLDERS))
+  })
+  as.integer(n)
+}
+
+#' Account for one scrape's packages in the submissions table.
+#'
+#' Incremental, because the two sides are not close and this runs every hour: a
+#' full rebuild reads all 3.55M rows for 58s at best, while accounting for one
+#' scrape's packages is 1.5s, both measured against the published database.
+#'
+#' Neither number is constant, and the incremental one is not proportional to the
+#' scrape either. A package that has sat in the queue for years is rescanned in
+#' full whenever it turns up in a scrape, and three of them (fritools, climate,
+#' factset.protobuf.stachextensions) carry about 28,000 snapshot rows each, which
+#' is what most of that 1.5s is. Narrowing to the exact pairs the scrape names
+#' rather than their packages saves 2% of the rows read and is not worth having
+#' two definitions of what gets rewritten.
+#'
+#' It recomputes rather than upserts. The affected rows are deleted and derived
+#' again from the stream by the same query the full rebuild uses, so first_seen,
+#' n_observations and last_folder are never carried across runs and never
+#' accumulate: re-running a scrape already accounted for lands on the same answer
+#' instead of counting it twice, which is exactly what a counter kept in place
+#' would get wrong. Every version of the packages in the scrape is recomputed,
+#' not only the pairs the scrape names, which also repairs any row previously
+#' written wrong.
+#'
+#' Two cases still need the whole stream, and both are settled by one query
+#' against indexed minima:
+#'   * the table is empty, which is the first run after this ships and any
+#'     consumer building the table for the first time;
+#'   * the stream now reaches further back than the table does, which is exactly
+#'     what backfill-snapshots.R leaves behind when it loads six years of older
+#'     scrapes; those rows belong to packages this scrape will never name, so a
+#'     narrowed update would leave them with a first_seen from after the import.
+#'
+#' That second test is only sufficient because of how the one importer we have
+#' behaves: backfill-snapshots.R keeps only rows strictly older than the earliest
+#' snapshot already stored, so every batch it writes STRICTLY LOWERS the stream's
+#' minimum and cannot help but be noticed. An importer that filled a hole in the
+#' middle, or that tied the minimum rather than lowering it, would move no
+#' minimum and its submissions would never be derived. Anything loading rows into
+#' queue_snapshots by another route should call rebuild_submissions() itself
+#' rather than assume this notices.
+#'
+#' A run that failed partway is not a third case. queue.db travels in the release
+#' asset and only a completed run publishes one, so a scrape whose submissions
+#' were never accounted for is discarded with the rest of that run rather than
+#' becoming the next run's input.
+#'
+#' Returns the number of submissions written.
+update_submissions <- function(con, snapshot_time = NULL) {
+  # A database that has never held the table has nothing to narrow against, and
+  # rebuild_submissions() creates it. Every sibling helper tolerates its table
+  # being absent and a consumer calling this directly should not have to know
+  # that update.R happens to run the CREATE first.
+  if (!"queue_submissions" %in% DBI::dbListTables(con)) return(rebuild_submissions(con))
+  reach <- DBI::dbGetQuery(con, "
+    SELECT (SELECT COUNT(*) FROM queue_submissions) AS built,
+           (SELECT MIN(first_seen) FROM queue_submissions) AS built_from,
+           (SELECT MIN(snapshot_time) FROM queue_snapshots) AS stream_from")
+  if (is.null(snapshot_time) || reach$built == 0L || is.na(reach$built_from) ||
+      (!is.na(reach$stream_from) && reach$stream_from < reach$built_from)) {
+    return(rebuild_submissions(con))
+  }
+
+  scrape_packages <- "SELECT package FROM queue_snapshots WHERE snapshot_time = ?"
+  n <- DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, sprintf("DELETE FROM queue_submissions WHERE package IN (%s)",
+                                scrape_packages),
+                   params = list(as.character(snapshot_time)))
+    DBI::dbExecute(con, submissions_query(sprintf("s.package IN (%s)", scrape_packages)),
+                   params = c(as.list(QUEUE_FOLDERS), list(as.character(snapshot_time))))
+  })
+  as.integer(n)
+}
+
 #' How far back each accumulating table reaches, not just how big it is.
 #'
 #' Recorded in the manifest so the NEXT run can check it did not lose anything.
@@ -131,11 +427,34 @@ queue_coverage <- function(db_path) {
                                     MAX(snapshot_time) AS hi FROM queue_snapshots")
   h <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n, COUNT(DISTINCT date) AS d,
                                     MIN(date) AS lo, MAX(date) AS hi FROM queue_history_daily")
-  list(
+  # queue_scrapes is the only record of a scrape that found nothing, and such a
+  # row cannot be rebuilt from queue_snapshots, so its reach is worth declaring
+  # alongside the others rather than left to be inferred.
+  sc <- if ("queue_scrapes" %in% DBI::dbListTables(con)) {
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n, MIN(snapshot_time) AS lo,
+                                 MAX(snapshot_time) AS hi FROM queue_scrapes")
+  } else NULL
+  # queue_submissions is derived from the stream rather than collected, but it is
+  # what every question about a submission reads, and an update narrowed to the
+  # wrong slice would leave it short without changing the stream it came from.
+  # Declaring its reach is what lets the next run notice that.
+  sub <- if ("queue_submissions" %in% DBI::dbListTables(con)) {
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n, MIN(first_seen) AS lo,
+                                 MAX(last_seen) AS hi FROM queue_submissions")
+  } else NULL
+
+  out <- list(
     queue_snapshots     = list(rows = as.integer(s$n), min = s$lo, max = s$hi),
     queue_history_daily = list(rows = as.integer(h$n), dates = as.integer(h$d),
                                min = h$lo, max = h$hi)
   )
+  if (!is.null(sc)) {
+    out$queue_scrapes <- list(rows = as.integer(sc$n), min = sc$lo, max = sc$hi)
+  }
+  if (!is.null(sub)) {
+    out$queue_submissions <- list(rows = as.integer(sub$n), min = sub$lo, max = sub$hi)
+  }
+  out
 }
 
 #' What this run would destroy relative to the release it started from.
@@ -183,6 +502,20 @@ retention_violations <- function(now, prior) {
   if (usable(days) && now$queue_history_daily$dates < as.integer(days)) {
     out <- c(out, sprintf("queue_history_daily fell from %d days to %d",
                           as.integer(days), now$queue_history_daily$dates))
+  }
+
+  scr_rows <- prior$coverage$queue_scrapes$rows
+  if (usable(scr_rows) && usable(now$queue_scrapes$rows) &&
+      now$queue_scrapes$rows < as.integer(scr_rows)) {
+    out <- c(out, sprintf("queue_scrapes fell from %d rows to %d",
+                          as.integer(scr_rows), now$queue_scrapes$rows))
+  }
+
+  sub_rows <- prior$coverage$queue_submissions$rows
+  if (usable(sub_rows) && usable(now$queue_submissions$rows) &&
+      now$queue_submissions$rows < as.integer(sub_rows)) {
+    out <- c(out, sprintf("queue_submissions fell from %d rows to %d",
+                          as.integer(sub_rows), now$queue_submissions$rows))
   }
 
   day_min <- prior$coverage$queue_history_daily$min
