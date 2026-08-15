@@ -44,14 +44,30 @@ stopifnot(file.exists(db_path), dir.exists(history_dir))
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
+# A file yields either rows or one of two very different nothings, and the
+# counters keep them apart. A file we could not parse is a gap in the history. A
+# file that parsed cleanly and held no packages is an observation: the queue was
+# empty at that moment. Three of the archive's 44,007 files are the latter
+# (2023-08-28, 2023-09-07, 2023-09-16), each 63 bytes of bare header.
+#
+# Known limitation, shared with our own scrape: an empty snapshot leaves no
+# trace. The schema is one row per package per scrape, so "the queue was empty
+# at 06:22" and "no scrape ran at 06:22" cannot be told apart afterwards. It
+# costs nothing today, because each day holding an empty snapshot also holds
+# twenty-odd non-empty ones and so still reaches the daily series. A day whose
+# ONLY scrape was empty would be absent from that series rather than recorded
+# as a zero.
+EMPTY <- structure(list(), class = "empty_snapshot")
+
 # The archive's header has changed several times. Every variant carries the five
 # things we need, under different names, so normalize rather than branch on a
-# declared version that early files do not have.
+# declared version that the early files do not have.
 read_snapshot <- function(path) {
   df <- tryCatch(
     read.csv(path, stringsAsFactors = FALSE, colClasses = "character"),
     error = function(e) NULL)
-  if (is.null(df) || nrow(df) == 0L) return(NULL)
+  if (is.null(df)) return(NULL)
+  if (nrow(df) == 0L) return(EMPTY)
 
   snapshot_time <- if (!is.null(df$snapshot_time)) df$snapshot_time
     else if (!is.null(df$date) && !is.null(df$time)) paste(df$date, df$time)
@@ -94,7 +110,7 @@ cat(sprintf("archive: %d csv files\n", length(files)))
 dbExecute(con, "PRAGMA journal_mode=WAL")
 dbExecute(con, "PRAGMA synchronous=OFF")
 
-kept <- 0L; skipped_overlap <- 0L; unreadable <- 0L
+kept <- 0L; skipped_overlap <- 0L; unparseable <- 0L; empty_snapshots <- 0L
 batch <- vector("list", 0L); batch_rows <- 0L
 
 flush_batch <- function() {
@@ -108,7 +124,8 @@ flush_batch <- function() {
 dbExecute(con, "BEGIN")
 for (i in seq_along(files)) {
   rows <- read_snapshot(files[i])
-  if (is.null(rows)) { unreadable <- unreadable + 1L; next }
+  if (inherits(rows, "empty_snapshot")) { empty_snapshots <- empty_snapshots + 1L; next }
+  if (is.null(rows)) { unparseable <- unparseable + 1L; next }
 
   n_all <- nrow(rows)
   rows <- rows[rows$snapshot_time < cutoff, , drop = FALSE]
@@ -125,8 +142,10 @@ for (i in seq_along(files)) {
 flush_batch()
 dbExecute(con, "COMMIT")
 
-cat(sprintf("imported: %d rows  (skipped %d overlapping, %d unreadable files)\n",
-            kept, skipped_overlap, unreadable))
+cat(sprintf("imported: %d rows  (skipped %d overlapping)\n", kept, skipped_overlap))
+cat(sprintf("files: %d empty snapshots (queue was empty, nothing to store), %d unparseable\n",
+            empty_snapshots, unparseable))
+if (unparseable > 0L) cat("NOTE: an unparseable file is a real gap; the empty ones are not.\n")
 
 after <- dbGetQuery(con, "SELECT COUNT(*) n, MIN(snapshot_time) lo, MAX(snapshot_time) hi,
                                  COUNT(DISTINCT snapshot_time) s FROM queue_snapshots")
