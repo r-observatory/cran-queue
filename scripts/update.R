@@ -181,6 +181,22 @@ if (length(all_entries) > 0) {
   cat("No entries found across all folders\n")
 }
 
+# --- Record the scrape itself, whatever it found ---
+# An empty queue writes no snapshot rows, so without this a clear queue and a
+# run that never happened look identical afterwards. CRAN's incoming queue drained
+# to single digits in August 2026, so this is not a hypothetical shape.
+dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS queue_scrapes (
+    snapshot_time TEXT PRIMARY KEY,
+    package_count INTEGER NOT NULL
+  )
+")
+# Six years of snapshots predate the table; recover what can be recovered once.
+# Additive, so the empty scrapes it cannot derive are never disturbed.
+backfilled <- backfill_scrapes(con)
+if (backfilled > 0L) cat("Recovered", backfilled, "past scrapes into queue_scrapes\n")
+record_scrape(con, snapshot_time, if (length(all_entries) > 0) nrow(combined) else 0L)
+
 # --- Roll the snapshots up into the daily history ---
 # import-history.R seeds this table once from cransays and then skips itself
 # forever, so without this step the series the site charts stops on the day of

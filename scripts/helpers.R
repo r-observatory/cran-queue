@@ -72,6 +72,61 @@ queue_history_complete <- function(db_path, min_rows = HISTORY_BOOTSTRAP_MIN) {
 QUEUE_FOLDERS <- c("newbies", "inspect", "pending", "waiting",
                    "pretest", "recheck", "publish", "archive")
 
+#' Record that a scrape happened, and what it found.
+#'
+#' queue_snapshots holds one row per package per scrape, so a scrape that found
+#' an empty queue writes nothing and afterwards cannot be told apart from a
+#' scrape that never ran: both have no rows for that moment. That distinction
+#' matters to any reading of the series, because a day with no bar should mean
+#' "we were not looking" and a day with a zero bar should mean "the queue was
+#' clear", and today both render as the day simply not existing.
+#'
+#' Keyed on the scrape time, so a re-run replaces rather than duplicates.
+record_scrape <- function(con, snapshot_time, package_count) {
+  DBI::dbExecute(con,
+    "INSERT OR REPLACE INTO queue_scrapes (snapshot_time, package_count) VALUES (?, ?)",
+    params = list(as.character(snapshot_time), as.integer(package_count)))
+  invisible(NULL)
+}
+
+#' Reconstruct the scrape record from the snapshots already stored.
+#'
+#' Six years of snapshots predate this table. Every scrape that found anything
+#' can be recovered from them exactly, since each carries its own timestamp.
+#'
+#' Deliberately additive: a scrape already recorded is left alone. Rebuilding the
+#' table from queue_snapshots instead would erase every empty scrape, which is
+#' precisely the row this table exists to hold and the one that cannot be derived
+#' from snapshots at all.
+#'
+#' Returns the number of scrapes recorded.
+backfill_scrapes <- function(con) {
+  n <- DBI::dbExecute(con, "
+    INSERT OR IGNORE INTO queue_scrapes (snapshot_time, package_count)
+      SELECT snapshot_time, COUNT(*) FROM queue_snapshots GROUP BY snapshot_time")
+  as.integer(n)
+}
+
+#' Which days in a range were observed at all, and how often.
+#'
+#' A day is observed when at least one scrape ran on it, whatever it found. The
+#' caller renders an unobserved day as a break and an observed-but-empty day as a
+#' zero, which are different statements about the queue.
+observed_days <- function(con, from, to) {
+  days <- DBI::dbGetQuery(con, "
+    WITH RECURSIVE cal(d) AS (
+      SELECT date(?1)
+      UNION ALL SELECT date(d, '+1 day') FROM cal WHERE d < date(?2)
+    )
+    SELECT cal.d AS date,
+           (SELECT COUNT(*) FROM queue_scrapes s
+             WHERE date(s.snapshot_time) = cal.d) AS scrapes
+      FROM cal ORDER BY cal.d", params = list(as.character(from), as.character(to)))
+  days$scrapes <- as.integer(days$scrapes)
+  days$observed <- days$scrapes > 0L
+  days
+}
+
 #' Which folder a cransays archive row belongs in, in OUR vocabulary.
 #'
 #' The archive and our own scrape record the same fact differently. cransays
@@ -159,11 +214,23 @@ queue_coverage <- function(db_path) {
                                     MAX(snapshot_time) AS hi FROM queue_snapshots")
   h <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n, COUNT(DISTINCT date) AS d,
                                     MIN(date) AS lo, MAX(date) AS hi FROM queue_history_daily")
-  list(
+  # queue_scrapes is the only record of a scrape that found nothing, and such a
+  # row cannot be rebuilt from queue_snapshots, so its reach is worth declaring
+  # alongside the others rather than left to be inferred.
+  sc <- if ("queue_scrapes" %in% DBI::dbListTables(con)) {
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n, MIN(snapshot_time) AS lo,
+                                 MAX(snapshot_time) AS hi FROM queue_scrapes")
+  } else NULL
+
+  out <- list(
     queue_snapshots     = list(rows = as.integer(s$n), min = s$lo, max = s$hi),
     queue_history_daily = list(rows = as.integer(h$n), dates = as.integer(h$d),
                                min = h$lo, max = h$hi)
   )
+  if (!is.null(sc)) {
+    out$queue_scrapes <- list(rows = as.integer(sc$n), min = sc$lo, max = sc$hi)
+  }
+  out
 }
 
 #' What this run would destroy relative to the release it started from.
@@ -211,6 +278,13 @@ retention_violations <- function(now, prior) {
   if (usable(days) && now$queue_history_daily$dates < as.integer(days)) {
     out <- c(out, sprintf("queue_history_daily fell from %d days to %d",
                           as.integer(days), now$queue_history_daily$dates))
+  }
+
+  scr_rows <- prior$coverage$queue_scrapes$rows
+  if (usable(scr_rows) && usable(now$queue_scrapes$rows) &&
+      now$queue_scrapes$rows < as.integer(scr_rows)) {
+    out <- c(out, sprintf("queue_scrapes fell from %d rows to %d",
+                          as.integer(scr_rows), now$queue_scrapes$rows))
   }
 
   day_min <- prior$coverage$queue_history_daily$min
