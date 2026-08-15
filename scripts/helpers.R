@@ -72,6 +72,34 @@ queue_history_complete <- function(db_path, min_rows = HISTORY_BOOTSTRAP_MIN) {
 QUEUE_FOLDERS <- c("newbies", "inspect", "pending", "waiting",
                    "pretest", "recheck", "publish", "archive")
 
+#' Which folder a cransays archive row belongs in, in OUR vocabulary.
+#'
+#' The archive and our own scrape record the same fact differently. cransays
+#' files a package sitting with a named CRAN reviewer as folder "human" with the
+#' reviewer's initials in a separate subfolder column; our scrape has no
+#' subfolder and records those initials as the folder itself. Imported verbatim,
+#' six years of reviewer work would sit under one "human" bucket while our own
+#' months carry the initials, and no query could span the join.
+#'
+#' So a reviewer row takes its identity from the subfolder, and everything else
+#' keeps its folder. Three cases have to be excluded from that rule, all of them
+#' present in the archive:
+#'   * the subfolder repeats the folder name ("newbies"/"newbies"), an
+#'     inconsistency the archive carries throughout;
+#'   * the subfolder is absent, empty, the string "NA", or a bare "/";
+#'   * the subfolder describes the CHECK rather than a person
+#'     ("special/valgrind"), which our scrape does not record at all, so keeping
+#'     the parent folder is what makes the two eras comparable.
+#'
+#' Vectorised: a whole snapshot goes through in one call.
+cransays_folder <- function(folder, subfolder) {
+  folder <- as.character(folder)
+  subfolder <- as.character(subfolder)
+  usable <- !is.na(subfolder) & nzchar(subfolder) & subfolder != "NA" &
+    subfolder != "/" & subfolder != folder & !grepl("/", subfolder, fixed = TRUE)
+  ifelse(folder == "human" & usable, subfolder, folder)
+}
+
 #' Roll the hourly snapshot stream up into one row per (day, folder).
 #'
 #' queue_history_daily is what the site's queue chart reads. It was seeded once
