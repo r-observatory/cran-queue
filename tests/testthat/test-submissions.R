@@ -280,3 +280,62 @@ test_that("coverage declares how far the submissions reach, and tolerates their 
 
   expect_null(queue_coverage(path)$queue_submissions)
 })
+
+# --- follow-ups from review of the first cut ---
+
+test_that("a database that has never HELD the table gets a full build, not an error", {
+  # The earlier test of this created the table empty in its fixture, so it only
+  # proved the empty case. update.R happens to run CREATE TABLE IF NOT EXISTS
+  # first, but every sibling helper tolerates the table being absent and a
+  # consumer calling this directly should not have to know the ordering.
+  con <- sub_db(snapshots = snap("2026-08-15 09:00:00", "Aaa"))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS queue_submissions")
+
+  n <- update_submissions(con, "2026-08-15 09:00:00")
+
+  expect_equal(n, 1L)
+  expect_equal(submissions(con)$package, "Aaa")
+})
+
+test_that("a shrunken submissions table is refused against the release before it", {
+  # queue_submissions is monotone over an append-only stream, so a fall is
+  # always a fault. Without this the manifest happily records a short table and
+  # the run publishes green, which is the hole the coverage comment promised was
+  # covered.
+  prior <- list(coverage = list(
+    queue_snapshots     = list(rows = 100L, min = "2020-09-12 07:13:00"),
+    queue_history_daily = list(dates = 50L, min = "2020-09-12"),
+    queue_submissions   = list(rows = 82048L)))
+  now <- list(queue_snapshots     = list(rows = 100L, min = "2020-09-12 07:13:00"),
+              queue_history_daily = list(dates = 50L, min = "2020-09-12"),
+              queue_submissions   = list(rows = 82046L))
+
+  bad <- paste(retention_violations(now, prior), collapse = " ")
+
+  expect_match(bad, "queue_submissions")
+  expect_match(bad, "82048")
+})
+
+test_that("a growing submissions table is accepted", {
+  prior <- list(coverage = list(
+    queue_snapshots     = list(rows = 100L, min = "2020-09-12 07:13:00"),
+    queue_history_daily = list(dates = 50L, min = "2020-09-12"),
+    queue_submissions   = list(rows = 82048L)))
+  now <- list(queue_snapshots     = list(rows = 108L, min = "2020-09-12 07:13:00"),
+              queue_history_daily = list(dates = 50L, min = "2020-09-12"),
+              queue_submissions   = list(rows = 82050L))
+
+  expect_equal(retention_violations(now, prior), character(0))
+})
+
+test_that("a prior release that predates the table does not trip the check", {
+  prior <- list(coverage = list(
+    queue_snapshots     = list(rows = 100L, min = "2020-09-12 07:13:00"),
+    queue_history_daily = list(dates = 50L, min = "2020-09-12")))
+  now <- list(queue_snapshots     = list(rows = 100L, min = "2020-09-12 07:13:00"),
+              queue_history_daily = list(dates = 50L, min = "2020-09-12"),
+              queue_submissions   = list(rows = 82048L))
+
+  expect_equal(retention_violations(now, prior), character(0))
+})
