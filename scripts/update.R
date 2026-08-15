@@ -212,6 +212,27 @@ dbExecute(con, "
 dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_qhd_date ON queue_history_daily(date)")
 cat("Rolled up", roll_up_daily_history(con), "daily history rows\n")
 
+# --- Roll the snapshots up into one row per submission ---
+# The stream describes moments; every question about a submission (how long did
+# this package+version sit, which folder did it end in) otherwise has to derive
+# the submission list by scanning all 3.55M rows first, 23.0s of a 23.8s query.
+# Only this run's packages are recomputed, 1.5s against the published database
+# where a full rebuild of the table is a minute or more; update_submissions()
+# falls back to that rebuild for the cases where narrowing would be wrong.
+dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS queue_submissions (
+    package TEXT NOT NULL,
+    version TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    submitted_at TEXT,
+    last_folder TEXT NOT NULL,
+    n_observations INTEGER NOT NULL,
+    PRIMARY KEY (package, version)
+  )
+")
+cat("Rewrote", update_submissions(con, snapshot_time), "submission rows\n")
+
 # --- Compute queue_stats ---
 dbExecute(con, "DROP TABLE IF EXISTS queue_stats")
 dbExecute(con, "
