@@ -240,3 +240,21 @@ test_that("a prior read of an empty folder, published with a null earliest date,
   expect_null(prior$coverage$queue_archive_episodes$min)
   expect_equal(retention_violations(now, prior), character(0))
 })
+
+test_that("coverage and the retention check include the per-folder read log", {
+  path <- cov_db(snaps("2026-03-09 21:02:32"), hist_rows("2020-09-12"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  record_folder_reads(con, "2026-10-01 00:12:00",
+                      data.frame(folder = c("inspect", "newbies"), outcome = "ok",
+                                 listed = c(1L, 2L), stringsAsFactors = FALSE))
+  DBI::dbDisconnect(con)
+
+  cov <- queue_coverage(path)
+
+  expect_equal(cov$queue_folder_reads,
+               list(rows = 2L, min = "2026-10-01 00:12:00", max = "2026-10-01 00:12:00"))
+  prior <- base_prior(queue_folder_reads = list(rows = 30L, min = "2026-09-30 00:00:00"))
+  bad <- paste(retention_violations(cov, prior), collapse = " ")
+  expect_match(bad, "queue_folder_reads fell from 30 rows to 2")
+  expect_match(bad, "queue_folder_reads.snapshot_time moved forward")
+})

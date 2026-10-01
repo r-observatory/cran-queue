@@ -419,7 +419,8 @@ update_submissions <- function(con, snapshot_time = NULL) {
 # Their rows can never fall, their earliest date can never move later, and one
 # that vanished counts as zero rows. None can be rebuilt from anything else.
 APPEND_ONLY_TABLES <- c(queue_archive_episodes = "first_seen",
-                        queue_archive_reads    = "read_at")
+                        queue_archive_reads    = "read_at",
+                        queue_folder_reads     = "snapshot_time")
 
 #' How far back each accumulating table reaches, not just how big it is.
 #'
@@ -854,4 +855,130 @@ archive_notes_line <- function(read) {
     ok      = sprintf("**Archive folder:** %d listed, %d new\n\n", read$listed, read$new),
     refused = "**Archive folder:** listed nothing after a non-empty read; not recorded, the next run today reads again\n\n",
     "**Archive folder:** not read; the next run today tries again\n\n")
+}
+
+# --- Per-folder reads of the hourly scrape ------------------------------------
+
+#' Parse the .tar.gz rows of one incoming subfolder page.
+parse_entries <- function(html, folder) {
+  # Apache mod_autoindex table format:
+  # <td><a href="Pkg_1.0.tar.gz">Pkg_1.0.tar.gz</a></td><td align="right">2026-03-09 14:28  </td>
+  # We split by lines and parse each
+  lines <- unlist(strsplit(html, "\n"))
+
+  # Pattern: anchor with .tar.gz, then non-digit chars (closing tags), then date+time
+  pattern <- '<a href="([^"]+\\.tar\\.gz)">[^<]+</a>[^0-9]*(\\d{4}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2})'
+
+  results <- list()
+  for (line in lines) {
+    m <- regmatches(line, regexec(pattern, line))[[1]]
+    if (length(m) == 4) {
+      filename <- m[2]
+      date_str <- m[3]
+      time_str <- m[4]
+      submitted_at <- paste0(date_str, " ", time_str)
+
+      # Parse package name and version from filename
+      # Pattern: PackageName_Version.tar.gz
+      pkg_match <- regmatches(filename, regexec("^(.+)_([^_]+)\\.tar\\.gz$", filename))[[1]]
+      if (length(pkg_match) == 3) {
+        pkg_name <- pkg_match[2]
+        pkg_version <- pkg_match[3]
+      } else {
+        pkg_name <- sub("\\.tar\\.gz$", "", filename)
+        pkg_version <- NA
+      }
+
+      results[[length(results) + 1]] <- data.frame(
+        package = pkg_name,
+        version = pkg_version,
+        folder = folder,
+        submitted_at = submitted_at,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  if (length(results) > 0) {
+    do.call(rbind, results)
+  } else {
+    data.frame(
+      package = character(0),
+      version = character(0),
+      folder = character(0),
+      submitted_at = character(0),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+#' Read every folder of one scrape.
+#'
+#' Returns list(entries, reads): `entries` holds one data frame per folder
+#' that listed tarballs, as the snapshot insert expects; `reads` has one row
+#' per folder with its outcome ("ok", "error" when the fetch threw,
+#' "not_index" when the page was not that folder's index) and `listed`, the
+#' tarball rows parsed (NA on "error"). A failed folder never stops the scrape.
+scrape_folders <- function(folders, fetch, base_url) {
+  entries <- list()
+  reads <- data.frame(folder = folders,
+                      outcome = rep(NA_character_, length(folders)),
+                      listed = rep(NA_integer_, length(folders)),
+                      stringsAsFactors = FALSE)
+  for (i in seq_along(folders)) {
+    folder <- folders[[i]]
+    cat("Scraping folder:", folder, "...\n")
+    tryCatch({
+      html <- fetch(paste0(base_url, folder, "/"))
+      found <- parse_entries(html, folder)
+      if (nrow(found) > 0) {
+        entries[[length(entries) + 1L]] <- found
+        cat("  Found", nrow(found), "packages\n")
+      } else {
+        cat("  No packages found\n")
+      }
+      reads$outcome[i] <- if (is_incoming_index(html, folder)) "ok" else "not_index"
+      reads$listed[i] <- nrow(found)
+    }, error = function(e) {
+      cat("  Error scraping folder", folder, ":", conditionMessage(e), "\n")
+      reads$outcome[i] <<- "error"
+    })
+  }
+  list(entries = entries, reads = reads)
+}
+
+#' Create queue_folder_reads: one row per folder per scrape.
+ensure_folder_reads <- function(con) {
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS queue_folder_reads (
+      snapshot_time TEXT NOT NULL,
+      folder        TEXT NOT NULL,
+      outcome       TEXT NOT NULL CHECK (outcome IN ('ok', 'error', 'not_index')),
+      listed        INTEGER,
+      PRIMARY KEY (snapshot_time, folder)
+    ) WITHOUT ROWID")
+  invisible(NULL)
+}
+
+#' Record which folders one scrape read and whether each read succeeded.
+#' Keyed on (snapshot_time, folder), so a re-run replaces rather than duplicates.
+record_folder_reads <- function(con, snapshot_time, reads) {
+  ensure_folder_reads(con)
+  n <- nrow(reads)
+  if (n == 0L) return(invisible(0L))
+  DBI::dbWithTransaction(con, DBI::dbExecute(con,
+    "INSERT OR REPLACE INTO queue_folder_reads (snapshot_time, folder, outcome, listed)
+     VALUES (?, ?, ?, ?)",
+    params = list(rep(as.character(snapshot_time), n), reads$folder, reads$outcome,
+                  as.integer(reads$listed))))
+  invisible(n)
+}
+
+#' The release-notes line naming the folders a scrape did not read, "" when
+#' every folder was read.
+folder_reads_notes_line <- function(reads) {
+  failed <- reads[reads$outcome != "ok", , drop = FALSE]
+  if (nrow(failed) == 0L) return("")
+  sprintf("**Folders not read:** %s\n\n",
+          paste0(failed$folder, " (", failed$outcome, ")", collapse = ", "))
 }

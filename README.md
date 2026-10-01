@@ -88,6 +88,17 @@ The folder records presence only and says nothing about why a file is there: its
 
 A file whose `last_seen` is older than the latest `read_at` has left the folder. A day with no read row was not read, so files that came and went that day are missing.
 
+### `queue_folder_reads`
+
+One row per folder per scrape. Scrapes before this table was added have no rows. A scrape with an `error` or `not_index` row lost that folder, so its count in `queue_scrapes` and the day's `queue_history_daily` row may be short.
+
+| Column | Type | Description |
+|---|---|---|
+| `snapshot_time` | TEXT | UTC timestamp of the scrape, as in `queue_scrapes` |
+| `folder` | TEXT | Incoming subfolder the scrape listed |
+| `outcome` | TEXT | `ok`, `error` (the fetch failed) or `not_index` (the page was not that folder's index) |
+| `listed` | INTEGER | Tarball rows read from the page, NULL on `error` |
+
 ## Update Schedule
 
 The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The first run of each UTC day also reads `incoming/archive/` into `queue_archive_episodes`. The latest database is always available from the most recent GitHub release. A `last-updated.txt` file in the repo tracks the last successful run time.
