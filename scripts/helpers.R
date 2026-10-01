@@ -654,3 +654,24 @@ write_manifest <- function(path, core,
   writeLines(json, path)
   invisible(path)
 }
+
+# --- CRAN incoming listings ---------------------------------------------------
+
+#' Subfolder names from the incoming index, as the hourly scrape reads them.
+#'
+#' `archive` stays excluded: scraped hourly, its four-week listing would land in
+#' queue_snapshots on every run and be charted and counted as a queue folder.
+#' read_archive_folder() reads it once a UTC day into its own tables instead.
+parse_folders <- function(html) {
+  # Match href="foldername/" links (directories end with /)
+  m <- gregexpr('href="([^"]+/)"', html)
+  matches <- regmatches(html, m)[[1]]
+  # Extract folder names (strip href=" and /")
+  folders <- sub('href="', '', matches)
+  folders <- sub('/"$', '', folders)
+  # Exclude parent directory link and "archive"
+  folders <- folders[!folders %in% c("..", ".", "archive")]
+  # Also exclude any absolute paths
+  folders <- folders[!grepl("^/", folders)]
+  folders
+}

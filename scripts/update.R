@@ -46,22 +46,6 @@ fetch_page <- function(url) {
   paste(readLines(con, warn = FALSE), collapse = "\n")
 }
 
-# --- Helper: parse subfolder names from the incoming index ---
-parse_folders <- function(html) {
-  # Match href="foldername/" links (directories end with /)
-  m <- gregexpr('href="([^"]+/)"', html)
-  matches <- regmatches(html, m)[[1]]
-  # Extract folder names (strip href=" and /")
-  folders <- sub('href="', '', matches)
-  folders <- sub('/"$', '', folders)
-  # Exclude parent directory link and "archive"
-  folders <- folders[!folders %in% c("..", ".", "archive")]
-  # Also exclude any absolute paths
-
-  folders <- folders[!grepl("^/", folders)]
-  folders
-}
-
 # --- Helper: parse .tar.gz entries from a subfolder page ---
 parse_entries <- function(html, folder) {
   # Apache mod_autoindex table format:
