@@ -64,9 +64,9 @@ con.close()
 
 ### `queue_archive_episodes`
 
-CRAN's `incoming/archive/` folder, read by the first run of each UTC day. The hourly snapshots skip this folder, so it never appears in `queue_snapshots` or the daily history. One row per archived file; a version uploaded more than once has one row per upload.
+CRAN's `incoming/archive/` folder, read by the first run of each UTC day. The hourly scrape skips this folder. One row per archived file; a version uploaded more than once has one row per upload.
 
-The folder records presence only and says nothing about why a file is there: its version may still be in the queue, a newer upload may follow, or the version may be published later. Outcomes are derived downstream by joining `queue_submissions` and CRAN's version history.
+The folder records presence only and says nothing about why a file is there: its version may still be in the queue, a newer upload may follow, or the version may be published later. No outcome is stored; that is left to be derived downstream.
 
 | Column | Type | Description |
 |---|---|---|
@@ -77,7 +77,7 @@ The folder records presence only and says nothing about why a file is there: its
 | `first_seen` | TEXT | UTC time of the first read that listed the file |
 | `last_seen` | TEXT | UTC time of the latest read that listed it |
 
-`first_seen` dates the archiving to within a day. On the first read, and on the first read after a day with no row in `queue_archive_reads`, it is only when reading began: those files may have been archived earlier.
+A file was not in the listing at the read before its `first_seen`, so it appeared between those two reads, whose times are in `queue_archive_reads`. For files listed by the earliest read, `first_seen` is only when reading began: they may have been archived earlier.
 
 ### `queue_archive_reads`
 
