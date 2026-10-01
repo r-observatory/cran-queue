@@ -675,3 +675,49 @@ parse_folders <- function(html) {
   folders <- folders[!grepl("^/", folders)]
   folders
 }
+
+#' TRUE when `html` is Apache's index page for /incoming/<path>. An error page
+#' served with a 200 must never read as an empty folder.
+is_incoming_index <- function(html, path) {
+  grepl(sprintf("<title>Index of /incoming/%s</title>", path), html, fixed = TRUE)
+}
+
+#' A size as CRAN's directory index writes it ("4.7K", "901K", "6.1M") in
+#' kilobytes; a bare number is bytes. Copied from cran-feed's parse_size_kb so
+#' the figure matches package_version_history.size_kb.
+parse_size_kb <- function(s) {
+  s <- trimws(s)
+  if (grepl("M$", s)) return(as.numeric(sub("M$", "", s)) * 1024)
+  if (grepl("K$", s)) return(as.numeric(sub("K$", "", s)))
+  as.numeric(s) / 1024
+}
+
+#' Parse CRAN's incoming/archive/ listing.
+#'
+#' Returns package, version, mtime and size_kb, one row per tarball; a
+#' zero-row frame when the index lists none; NULL when the page is not the
+#' archive index. mtime is kept as listed, on CRAN's clock (Europe/Vienna),
+#' the same clock as queue_snapshots.submitted_at. A name that does not split
+#' gets version 'NA', as queue_submissions does, so the key never holds NULL.
+parse_archive_listing <- function(html) {
+  if (!is_incoming_index(html, "archive")) return(NULL)
+  lines <- unlist(strsplit(html, "\n", fixed = TRUE))
+  pattern <- paste0('<a href="([^"/]+\\.tar\\.gz)">[^<]*</a>',
+                    '.*?(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2})\\s*</td>',
+                    '\\s*<td[^>]*>\\s*([0-9.]+[KMG]?)\\s*</td>')
+  m <- regmatches(lines, regexec(pattern, lines, perl = TRUE))
+  m <- m[lengths(m) == 4L]
+  if (length(m) == 0L) {
+    return(data.frame(package = character(0), version = character(0),
+                      mtime = character(0), size_kb = numeric(0),
+                      stringsAsFactors = FALSE))
+  }
+  stem <- sub("\\.tar\\.gz$", "", vapply(m, `[`, "", 2L))
+  splits <- grepl("^.+_[^_]+$", stem)
+  data.frame(
+    package = ifelse(splits, sub("_[^_]+$", "", stem), stem),
+    version = ifelse(splits, sub("^.+_", "", stem), "NA"),
+    mtime   = vapply(m, `[`, "", 3L),
+    size_kb = round(vapply(vapply(m, `[`, "", 4L), parse_size_kb, 0), 1),
+    stringsAsFactors = FALSE)
+}
