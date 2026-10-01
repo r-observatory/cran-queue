@@ -721,3 +721,72 @@ parse_archive_listing <- function(html) {
     size_kb = round(vapply(vapply(m, `[`, "", 4L), parse_size_kb, 0), 1),
     stringsAsFactors = FALSE)
 }
+
+# --- CRAN incoming/archive/ episodes ------------------------------------------
+
+#' Create the two archive tables. One episode per archived file, keyed with
+#' mtime because one version is often uploaded more than once; one read row per
+#' daily read, which tells "left the folder" from "not read" and marks the
+#' first_seen values that are only when reading began.
+ensure_archive_tables <- function(con) {
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS queue_archive_episodes (
+      package TEXT NOT NULL, version TEXT NOT NULL,
+      mtime TEXT NOT NULL,          -- as listed, Europe/Vienna
+      size_kb REAL,
+      first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,  -- UTC snapshot_time
+      PRIMARY KEY (package, version, mtime)) WITHOUT ROWID")
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_qae_first_seen ON queue_archive_episodes(first_seen)")
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS queue_archive_reads (
+      read_at TEXT PRIMARY KEY, listed INTEGER NOT NULL)")
+  invisible(NULL)
+}
+
+#' TRUE when no archive read falls on the UTC date of `snapshot_time`.
+archive_read_due <- function(con, snapshot_time) {
+  if (!"queue_archive_reads" %in% DBI::dbListTables(con)) return(TRUE)
+  n <- DBI::dbGetQuery(con,
+    "SELECT COUNT(*) AS n FROM queue_archive_reads WHERE substr(read_at, 1, 10) = ?",
+    params = list(substr(as.character(snapshot_time), 1L, 10L)))$n
+  n == 0L
+}
+
+#' Record one read of the archive listing: upsert every listed file and write
+#' the read row, in one transaction.
+#'
+#' Refuses a zero-row listing when the previous read listed files, so a changed
+#' page layout cannot end every open episode at once; it warns and writes
+#' nothing, and the next run that day reads again.
+#'
+#' Returns the number of new episodes, or NA when refused.
+record_archive_read <- function(con, entries, read_at) {
+  ensure_archive_tables(con)
+  read_at <- as.character(read_at)
+  prev <- DBI::dbGetQuery(con,
+    "SELECT listed FROM queue_archive_reads ORDER BY read_at DESC LIMIT 1")$listed
+  if (nrow(entries) == 0L && length(prev) == 1L && prev > 0L) {
+    cat(sprintf("::warning::incoming/archive/ listed no files after a read that listed %d; not recorded\n",
+                prev))
+    return(NA_integer_)
+  }
+  count <- function() DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM queue_archive_episodes")$n
+  DBI::dbWithTransaction(con, {
+    before <- count()
+    DBI::dbExecute(con, "INSERT OR REPLACE INTO queue_archive_reads (read_at, listed) VALUES (?, ?)",
+                   params = list(read_at, nrow(entries)))
+    if (nrow(entries) > 0L) {
+      DBI::dbExecute(con, "
+        INSERT INTO queue_archive_episodes
+          (package, version, mtime, size_kb, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (package, version, mtime)
+          DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
+        params = list(entries$package, entries$version, entries$mtime,
+                      entries$size_kb, rep(read_at, nrow(entries)),
+                      rep(read_at, nrow(entries))))
+    }
+    as.integer(count() - before)
+  })
+}
