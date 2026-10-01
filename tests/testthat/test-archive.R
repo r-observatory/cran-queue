@@ -177,3 +177,79 @@ test_that("a read late in the day does not satisfy the run just after midnight U
 
   expect_true(archive_read_due(con, "2026-10-02 00:00:01"))
 })
+
+serve <- function(html) function(url) html
+refuse <- function(url) stop("HTTP error 503")
+
+test_that("a due read fetches the archive folder and records it", {
+  con <- archive_db(); on.exit(DBI::dbDisconnect(con), add = TRUE)
+  asked <- NULL
+  fetch <- function(url) { asked <<- url; archive_html() }
+
+  got <- read_archive_folder(con, "2026-10-01 00:12:00", fetch, "https://cran.r-project.org/incoming/")
+
+  expect_equal(asked, "https://cran.r-project.org/incoming/archive/")
+  expect_equal(got, list(status = "ok", listed = 3L, new = 3L))
+  expect_equal(archive_notes_line(got), "**Archive folder:** 3 listed, 3 new\n\n")
+})
+
+test_that("a read that is not due fetches nothing and adds no notes line", {
+  con <- archive_db(); on.exit(DBI::dbDisconnect(con), add = TRUE)
+  read_archive_folder(con, "2026-10-01 00:12:00", serve(archive_html()), "https://x/")
+
+  got <- read_archive_folder(con, "2026-10-01 06:00:00", refuse, "https://x/")
+
+  expect_equal(got$status, "not_due")
+  expect_equal(archive_notes_line(got), "")
+})
+
+test_that("a failed fetch never stops the run and leaves no read row, so the next run retries", {
+  con <- archive_db(); on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  expect_output(got <- read_archive_folder(con, "2026-10-01 00:12:00", refuse, "https://x/"),
+                "Archive read failed")
+
+  expect_equal(got$status, "failed")
+  expect_true(archive_read_due(con, "2026-10-01 01:00:00"))
+  expect_match(archive_notes_line(got), "not read")
+})
+
+test_that("an error page served with 200 is a failed read, not an empty folder", {
+  con <- archive_db(); on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  expect_output(got <- read_archive_folder(con, "2026-10-01 00:12:00",
+                                           serve("<html><title>Service Unavailable</title></html>"),
+                                           "https://x/"),
+                "not the archive index")
+
+  expect_equal(got$status, "not_index")
+  expect_true(archive_read_due(con, "2026-10-01 01:00:00"))
+})
+
+test_that("a failure while recording never stops the run and leaves no read row", {
+  con <- archive_db(); on.exit(DBI::dbDisconnect(con), add = TRUE)
+  ensure_archive_tables(con)
+  DBI::dbExecute(con, "CREATE TRIGGER qae_fail BEFORE INSERT ON queue_archive_episodes
+                         BEGIN SELECT RAISE(ABORT, 'episode insert failed'); END")
+
+  expect_output(got <- read_archive_folder(con, "2026-10-01 00:12:00", serve(archive_html()),
+                                           "https://x/"),
+                "episode insert failed")
+
+  expect_equal(got$status, "failed")
+  expect_equal(nrow(reads(con)), 0L)
+})
+
+test_that("a refused empty listing is reported in the notes and retried", {
+  con <- archive_db(); on.exit(DBI::dbDisconnect(con), add = TRUE)
+  read_archive_folder(con, "2026-10-01 00:12:00", serve(archive_html()), "https://x/")
+  lines <- readLines(test_path("fixtures", "archive-listing.html"))
+  empty <- paste(lines[!grepl("compressed.gif", lines, fixed = TRUE)], collapse = "\n")
+
+  expect_output(got <- read_archive_folder(con, "2026-10-02 00:10:00", serve(empty), "https://x/"),
+                "::warning::")
+
+  expect_equal(got$status, "refused")
+  expect_match(archive_notes_line(got), "listed nothing")
+  expect_true(archive_read_due(con, "2026-10-02 01:00:00"))
+})

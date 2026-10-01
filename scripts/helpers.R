@@ -790,3 +790,41 @@ record_archive_read <- function(con, entries, read_at) {
     as.integer(count() - before)
   })
 }
+
+#' Read CRAN's incoming/archive/ when this run is the first of its UTC day.
+#'
+#' Never throws: the hourly scrape is the product, so a failed read is logged
+#' and leaves no read row, and the next run that day tries again. `fetch` takes
+#' a URL and returns the page as one string (update.R passes fetch_page).
+#'
+#' Returns list(status, listed, new); status is "not_due", "ok", "failed",
+#' "not_index" or "refused".
+read_archive_folder <- function(con, snapshot_time, fetch, base_url) {
+  tryCatch({
+    if (!archive_read_due(con, snapshot_time)) {
+      list(status = "not_due", listed = NA_integer_, new = NA_integer_)
+    } else {
+      entries <- parse_archive_listing(fetch(paste0(base_url, "archive/")))
+      if (is.null(entries)) {
+        cat("  Archive read failed: the page is not the archive index\n")
+        list(status = "not_index", listed = NA_integer_, new = NA_integer_)
+      } else {
+        new <- record_archive_read(con, entries, snapshot_time)
+        list(status = if (is.na(new)) "refused" else "ok",
+             listed = nrow(entries), new = new)
+      }
+    }
+  }, error = function(e) {
+    cat("  Archive read failed:", conditionMessage(e), "\n")
+    list(status = "failed", listed = NA_integer_, new = NA_integer_)
+  })
+}
+
+#' The release-notes line for this run's archive read, "" when none was due.
+archive_notes_line <- function(read) {
+  switch(read$status,
+    not_due = "",
+    ok      = sprintf("**Archive folder:** %d listed, %d new\n\n", read$listed, read$new),
+    refused = "**Archive folder:** listed nothing after a non-empty read; not recorded, the next run today reads again\n\n",
+    "**Archive folder:** not read; the next run today tries again\n\n")
+}

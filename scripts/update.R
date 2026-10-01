@@ -217,6 +217,14 @@ dbExecute(con, "
 ")
 cat("Rewrote", update_submissions(con, snapshot_time), "submission rows\n")
 
+# --- CRAN's incoming/archive/, read once a UTC day into its own tables ---
+# A failed read never fails the run and leaves no read row, so the next run
+# that day tries again.
+archive_read <- read_archive_folder(con, snapshot_time, fetch_page, cran_incoming_url)
+if (archive_read$status == "ok") {
+  cat("Archive folder:", archive_read$listed, "listed,", archive_read$new, "new\n")
+}
+
 # --- Compute queue_stats ---
 dbExecute(con, "DROP TABLE IF EXISTS queue_stats")
 dbExecute(con, "
@@ -267,6 +275,7 @@ release_notes <- paste0(
   "**Total packages in this snapshot:** ", total_packages, "\n\n",
   "### Per-folder counts\n\n",
   paste(folder_lines, collapse = "\n"), "\n\n",
+  archive_notes_line(archive_read),
   "**Total accumulated snapshots:** ", total_snapshots, "\n\n",
   "**Database size:** ", db_size, "\n"
 )

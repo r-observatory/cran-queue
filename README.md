@@ -62,9 +62,35 @@ con.close()
 | `folder` | TEXT | Incoming subfolder |
 | `total_packages` | INTEGER | Total package entries observed that month in that folder |
 
+### `queue_archive_episodes`
+
+CRAN's `incoming/archive/` folder, read by the first run of each UTC day. The hourly snapshots skip this folder, so it never appears in `queue_snapshots` or the daily history. One row per archived file; a version uploaded more than once has one row per upload.
+
+The folder records presence only and says nothing about why a file is there: its version may still be in the queue, a newer upload may follow, or the version may be published later. Outcomes are derived downstream by joining `queue_submissions` and CRAN's version history.
+
+| Column | Type | Description |
+|---|---|---|
+| `package` | TEXT | Package name |
+| `version` | TEXT | Package version, `NA` when the file name does not split into package and version |
+| `mtime` | TEXT | Last-modified time as the listing shows it, `YYYY-MM-DD HH:MM` on CRAN's server clock (Europe/Vienna), the same clock as `submitted_at`. It is the upload time, not the time the file was archived |
+| `size_kb` | REAL | Size in kilobytes as the listing rounds it (`2.6M` is 2662.4) |
+| `first_seen` | TEXT | UTC time of the first read that listed the file |
+| `last_seen` | TEXT | UTC time of the latest read that listed it |
+
+`first_seen` dates the archiving to within a day. On the first read, and on the first read after a day with no row in `queue_archive_reads`, it is only when reading began: those files may have been archived earlier.
+
+### `queue_archive_reads`
+
+| Column | Type | Description |
+|---|---|---|
+| `read_at` | TEXT | UTC time of the read, the snapshot time of the run that made it |
+| `listed` | INTEGER | Files the listing held |
+
+A file whose `last_seen` is older than the latest `read_at` has left the folder. A day with no read row was not read, so files that came and went that day are missing.
+
 ## Update Schedule
 
-The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The latest database is always available from the most recent GitHub release. A `last-updated.txt` file in the repo tracks the last successful run time.
+The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The first run of each UTC day also reads `incoming/archive/` into `queue_archive_episodes`. The latest database is always available from the most recent GitHub release. A `last-updated.txt` file in the repo tracks the last successful run time.
 
 ## License
 
