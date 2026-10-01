@@ -120,11 +120,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v$(date -u +'%Y%m%d-%H%M%S')"
-          # Both assets for now. Consumers still pulling queue.db keep working
-          # while they move to queue.db.zst, which is the one that has room to
-          # grow; the plain copy comes out once nothing reads it.
+          # The compressed database only. Older releases keep the plain copy.
           gh release create "$TAG" \
-            queue.db \
             queue.db.zst \
             manifest.json \
             --title "Queue snapshot $TAG" \
