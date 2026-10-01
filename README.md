@@ -62,9 +62,46 @@ con.close()
 | `folder` | TEXT | Incoming subfolder |
 | `total_packages` | INTEGER | Total package entries observed that month in that folder |
 
+### `queue_archive_episodes`
+
+CRAN's `incoming/archive/` folder, read by the first run of each UTC day. The hourly scrape skips this folder. One row per archived file; a version uploaded more than once has one row per upload.
+
+The folder records presence only and says nothing about why a file is there: its version may still be in the queue, a newer upload may follow, or the version may be published later. No outcome is stored; that is left to be derived downstream.
+
+| Column | Type | Description |
+|---|---|---|
+| `package` | TEXT | Package name |
+| `version` | TEXT | Package version, `NA` when the file name does not split into package and version |
+| `mtime` | TEXT | Last-modified time as the listing shows it, `YYYY-MM-DD HH:MM` on CRAN's server clock (Europe/Vienna), the same clock as `submitted_at`. It is the upload time, not the time the file was archived |
+| `size_kb` | REAL | Size in kilobytes as the listing rounds it (`2.6M` is 2662.4) |
+| `first_seen` | TEXT | UTC time of the first read that listed the file |
+| `last_seen` | TEXT | UTC time of the latest read that listed it |
+
+A file was not in the listing at the read before its `first_seen`, so it appeared between those two reads, whose times are in `queue_archive_reads`. For files listed by the earliest read, `first_seen` is only when reading began: they may have been archived earlier.
+
+### `queue_archive_reads`
+
+| Column | Type | Description |
+|---|---|---|
+| `read_at` | TEXT | UTC time of the read, the snapshot time of the run that made it |
+| `listed` | INTEGER | Files the listing held |
+
+A file whose `last_seen` is older than the latest `read_at` has left the folder. A day with no read row was not read, so files that came and went that day are missing.
+
+### `queue_folder_reads`
+
+One row per folder per scrape. Scrapes before this table was added have no rows. A scrape with an `error` or `not_index` row lost that folder, so its count in `queue_scrapes` and the day's `queue_history_daily` row may be short.
+
+| Column | Type | Description |
+|---|---|---|
+| `snapshot_time` | TEXT | UTC timestamp of the scrape, as in `queue_scrapes` |
+| `folder` | TEXT | Incoming subfolder the scrape listed |
+| `outcome` | TEXT | `ok`, `error` (the fetch failed) or `not_index` (the page was not that folder's index) |
+| `listed` | INTEGER | Tarball rows read from the page, NULL on `error` |
+
 ## Update Schedule
 
-The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The latest database is always available from the most recent GitHub release. A `last-updated.txt` file in the repo tracks the last successful run time.
+The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The first run of each UTC day also reads `incoming/archive/` into `queue_archive_episodes`. The latest database is always available from the most recent GitHub release. A `last-updated.txt` file in the repo tracks the last successful run time.
 
 ## License
 

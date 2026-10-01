@@ -126,3 +126,135 @@ test_that("a genuine cold start has nothing to compare against and is allowed", 
          queue_history_daily = list(dates = 2002L, min = "2020-09-12")),
     NULL), character(0))
 })
+
+# The archive tables cannot be rebuilt: CRAN keeps about four weeks in the folder.
+archive_cov_db <- function(episodes = NULL, reads = NULL) {
+  path <- cov_db(snaps("2026-03-09 21:02:32"), hist_rows("2020-09-12"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  ensure_archive_tables(con)
+  if (!is.null(episodes)) DBI::dbWriteTable(con, "queue_archive_episodes", episodes, append = TRUE)
+  if (!is.null(reads)) DBI::dbWriteTable(con, "queue_archive_reads", reads, append = TRUE)
+  path
+}
+
+base_now <- function() {
+  list(queue_snapshots = list(rows = 100L, min = "2026-03-09 21:02:32"),
+       queue_history_daily = list(dates = 50L, min = "2020-09-12"))
+}
+
+base_prior <- function(...) {
+  list(coverage = c(list(
+    queue_snapshots = list(rows = 100L, min = "2026-03-09 21:02:32"),
+    queue_history_daily = list(dates = 50L, min = "2020-09-12")), list(...)))
+}
+
+test_that("coverage reports both archive tables by count and earliest date", {
+  db <- archive_cov_db(
+    episodes = data.frame(package = c("Aaa", "Bbb"), version = "1.0",
+                          mtime = "2026-09-20 10:00", size_kb = 20,
+                          first_seen = c("2026-10-01 00:12:00", "2026-10-02 01:05:00"),
+                          last_seen = "2026-10-02 01:05:00", stringsAsFactors = FALSE),
+    reads = data.frame(read_at = c("2026-10-01 00:12:00", "2026-10-02 01:05:00"),
+                       listed = c(1L, 2L), stringsAsFactors = FALSE))
+
+  cov <- queue_coverage(db)
+
+  expect_equal(cov$queue_archive_episodes,
+               list(rows = 2L, min = "2026-10-01 00:12:00", max = "2026-10-02 01:05:00"))
+  expect_equal(cov$queue_archive_reads,
+               list(rows = 2L, min = "2026-10-01 00:12:00", max = "2026-10-02 01:05:00"))
+})
+
+test_that("coverage leaves the archive tables out until they exist", {
+  cov <- queue_coverage(cov_db(snaps("2026-03-09 21:02:32"), hist_rows("2020-09-12")))
+
+  expect_null(cov$queue_archive_episodes)
+  expect_null(cov$queue_archive_reads)
+})
+
+test_that("fewer archive episodes or reads than the last release is refused", {
+  prior <- base_prior(
+    queue_archive_episodes = list(rows = 330L, min = "2026-10-01 00:12:00"),
+    queue_archive_reads = list(rows = 5L, min = "2026-10-01 00:12:00"))
+  now <- c(base_now(), list(
+    queue_archive_episodes = list(rows = 329L, min = "2026-10-01 00:12:00"),
+    queue_archive_reads = list(rows = 4L, min = "2026-10-01 00:12:00")))
+
+  bad <- paste(retention_violations(now, prior), collapse = " ")
+
+  expect_match(bad, "queue_archive_episodes fell from 330 rows to 329")
+  expect_match(bad, "queue_archive_reads fell from 5 rows to 4")
+})
+
+test_that("an earliest first_seen or read_at that moved forward is refused", {
+  prior <- base_prior(
+    queue_archive_episodes = list(rows = 330L, min = "2026-10-01 00:12:00"),
+    queue_archive_reads = list(rows = 5L, min = "2026-10-01 00:12:00"))
+  now <- c(base_now(), list(
+    queue_archive_episodes = list(rows = 340L, min = "2026-10-02 01:05:00"),
+    queue_archive_reads = list(rows = 6L, min = "2026-10-02 01:05:00")))
+
+  bad <- paste(retention_violations(now, prior), collapse = " ")
+
+  expect_match(bad, "queue_archive_episodes.first_seen moved forward")
+  expect_match(bad, "queue_archive_reads.read_at moved forward")
+})
+
+test_that("an archive table that vanished is a loss, not a table to skip", {
+  prior <- base_prior(queue_archive_episodes = list(rows = 330L, min = "2026-10-01 00:12:00"))
+
+  expect_match(paste(retention_violations(base_now(), prior), collapse = " "),
+               "queue_archive_episodes fell from 330 rows to 0")
+})
+
+test_that("growth in the archive tables is accepted", {
+  prior <- base_prior(
+    queue_archive_episodes = list(rows = 330L, min = "2026-10-01 00:12:00"),
+    queue_archive_reads = list(rows = 5L, min = "2026-10-01 00:12:00"))
+  now <- c(base_now(), list(
+    queue_archive_episodes = list(rows = 341L, min = "2026-10-01 00:12:00"),
+    queue_archive_reads = list(rows = 6L, min = "2026-10-01 00:12:00")))
+
+  expect_equal(retention_violations(now, prior), character(0))
+})
+
+test_that("a manifest from before the archive tables passes", {
+  now <- c(base_now(), list(
+    queue_archive_episodes = list(rows = 326L, min = "2026-10-01 00:12:00"),
+    queue_archive_reads = list(rows = 1L, min = "2026-10-01 00:12:00")))
+
+  expect_equal(retention_violations(now, base_prior()), character(0))
+})
+
+test_that("a prior read of an empty folder, published with a null earliest date, passes", {
+  # jsonlite writes an NA earliest date as null, which comes back as NULL.
+  prior <- jsonlite::fromJSON(as.character(jsonlite::toJSON(
+    base_prior(queue_archive_episodes = list(rows = 0L, min = NA_character_),
+               queue_archive_reads = list(rows = 1L, min = "2026-10-01 00:12:00")),
+    auto_unbox = TRUE, null = "null")), simplifyVector = FALSE)
+  now <- c(base_now(), list(
+    queue_archive_episodes = list(rows = 11L, min = "2026-10-02 01:05:00"),
+    queue_archive_reads = list(rows = 2L, min = "2026-10-01 00:12:00")))
+
+  expect_null(prior$coverage$queue_archive_episodes$min)
+  expect_equal(retention_violations(now, prior), character(0))
+})
+
+test_that("coverage and the retention check include the per-folder read log", {
+  path <- cov_db(snaps("2026-03-09 21:02:32"), hist_rows("2020-09-12"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  record_folder_reads(con, "2026-10-01 00:12:00",
+                      data.frame(folder = c("inspect", "newbies"), outcome = "ok",
+                                 listed = c(1L, 2L), stringsAsFactors = FALSE))
+  DBI::dbDisconnect(con)
+
+  cov <- queue_coverage(path)
+
+  expect_equal(cov$queue_folder_reads,
+               list(rows = 2L, min = "2026-10-01 00:12:00", max = "2026-10-01 00:12:00"))
+  prior <- base_prior(queue_folder_reads = list(rows = 30L, min = "2026-09-30 00:00:00"))
+  bad <- paste(retention_violations(cov, prior), collapse = " ")
+  expect_match(bad, "queue_folder_reads fell from 30 rows to 2")
+  expect_match(bad, "queue_folder_reads.snapshot_time moved forward")
+})

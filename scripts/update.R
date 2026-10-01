@@ -46,75 +46,6 @@ fetch_page <- function(url) {
   paste(readLines(con, warn = FALSE), collapse = "\n")
 }
 
-# --- Helper: parse subfolder names from the incoming index ---
-parse_folders <- function(html) {
-  # Match href="foldername/" links (directories end with /)
-  m <- gregexpr('href="([^"]+/)"', html)
-  matches <- regmatches(html, m)[[1]]
-  # Extract folder names (strip href=" and /")
-  folders <- sub('href="', '', matches)
-  folders <- sub('/"$', '', folders)
-  # Exclude parent directory link and "archive"
-  folders <- folders[!folders %in% c("..", ".", "archive")]
-  # Also exclude any absolute paths
-
-  folders <- folders[!grepl("^/", folders)]
-  folders
-}
-
-# --- Helper: parse .tar.gz entries from a subfolder page ---
-parse_entries <- function(html, folder) {
-  # Apache mod_autoindex table format:
-  # <td><a href="Pkg_1.0.tar.gz">Pkg_1.0.tar.gz</a></td><td align="right">2026-03-09 14:28  </td>
-  # We split by lines and parse each
-  lines <- unlist(strsplit(html, "\n"))
-
-  # Pattern: anchor with .tar.gz, then non-digit chars (closing tags), then date+time
-  pattern <- '<a href="([^"]+\\.tar\\.gz)">[^<]+</a>[^0-9]*(\\d{4}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2})'
-
-  results <- list()
-  for (line in lines) {
-    m <- regmatches(line, regexec(pattern, line))[[1]]
-    if (length(m) == 4) {
-      filename <- m[2]
-      date_str <- m[3]
-      time_str <- m[4]
-      submitted_at <- paste0(date_str, " ", time_str)
-
-      # Parse package name and version from filename
-      # Pattern: PackageName_Version.tar.gz
-      pkg_match <- regmatches(filename, regexec("^(.+)_([^_]+)\\.tar\\.gz$", filename))[[1]]
-      if (length(pkg_match) == 3) {
-        pkg_name <- pkg_match[2]
-        pkg_version <- pkg_match[3]
-      } else {
-        pkg_name <- sub("\\.tar\\.gz$", "", filename)
-        pkg_version <- NA
-      }
-
-      results[[length(results) + 1]] <- data.frame(
-        package = pkg_name,
-        version = pkg_version,
-        folder = folder,
-        submitted_at = submitted_at,
-        stringsAsFactors = FALSE
-      )
-    }
-  }
-
-  if (length(results) > 0) {
-    do.call(rbind, results)
-  } else {
-    data.frame(
-      package = character(0),
-      version = character(0),
-      folder = character(0),
-      submitted_at = character(0),
-      stringsAsFactors = FALSE
-    )
-  }
-}
-
 # --- Main ---
 cat("Connecting to database:", db_path, "\n")
 con <- dbConnect(SQLite(), db_path)
@@ -150,24 +81,9 @@ main_html <- fetch_page(cran_incoming_url)
 folders <- parse_folders(main_html)
 cat("Found folders:", paste(folders, collapse = ", "), "\n")
 
-# Scrape each folder
-all_entries <- list()
-for (folder in folders) {
-  folder_url <- paste0(cran_incoming_url, folder, "/")
-  cat("Scraping folder:", folder, "...\n")
-  tryCatch({
-    folder_html <- fetch_page(folder_url)
-    entries <- parse_entries(folder_html, folder)
-    if (nrow(entries) > 0) {
-      all_entries[[length(all_entries) + 1]] <- entries
-      cat("  Found", nrow(entries), "packages\n")
-    } else {
-      cat("  No packages found\n")
-    }
-  }, error = function(e) {
-    cat("  Error scraping folder", folder, ":", conditionMessage(e), "\n")
-  })
-}
+# Scrape each folder, noting for each one whether it was read
+scraped <- scrape_folders(folders, fetch_page, cran_incoming_url)
+all_entries <- scraped$entries
 
 # Combine and insert
 combined <- NULL
@@ -196,6 +112,8 @@ dbExecute(con, "
 backfilled <- backfill_scrapes(con)
 if (backfilled > 0L) cat("Recovered", backfilled, "past scrapes into queue_scrapes\n")
 record_scrape(con, snapshot_time, if (length(all_entries) > 0) nrow(combined) else 0L)
+# Which folders this scrape read, so a scrape that lost one is not taken for a quiet queue.
+record_folder_reads(con, snapshot_time, scraped$reads)
 
 # --- Roll the snapshots up into the daily history ---
 # import-history.R seeds this table once from cransays and then skips itself
@@ -232,6 +150,14 @@ dbExecute(con, "
   )
 ")
 cat("Rewrote", update_submissions(con, snapshot_time), "submission rows\n")
+
+# --- CRAN's incoming/archive/, read once a UTC day into its own tables ---
+# A failed read never fails the run and leaves no read row, so the next run
+# that day tries again.
+archive_read <- read_archive_folder(con, snapshot_time, fetch_page, cran_incoming_url)
+if (archive_read$status == "ok") {
+  cat("Archive folder:", archive_read$listed, "listed,", archive_read$new, "new\n")
+}
 
 # --- Compute queue_stats ---
 dbExecute(con, "DROP TABLE IF EXISTS queue_stats")
@@ -283,6 +209,8 @@ release_notes <- paste0(
   "**Total packages in this snapshot:** ", total_packages, "\n\n",
   "### Per-folder counts\n\n",
   paste(folder_lines, collapse = "\n"), "\n\n",
+  folder_reads_notes_line(scraped$reads),
+  archive_notes_line(archive_read),
   "**Total accumulated snapshots:** ", total_snapshots, "\n\n",
   "**Database size:** ", db_size, "\n"
 )

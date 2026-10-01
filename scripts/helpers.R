@@ -415,6 +415,13 @@ update_submissions <- function(con, snapshot_time = NULL) {
   as.integer(n)
 }
 
+# Tables that are only ever added to, each with the column that dates its rows.
+# Their rows can never fall, their earliest date can never move later, and one
+# that vanished counts as zero rows. None can be rebuilt from anything else.
+APPEND_ONLY_TABLES <- c(queue_archive_episodes = "first_seen",
+                        queue_archive_reads    = "read_at",
+                        queue_folder_reads     = "snapshot_time")
+
 #' How far back each accumulating table reaches, not just how big it is.
 #'
 #' Recorded in the manifest so the NEXT run can check it did not lose anything.
@@ -453,6 +460,13 @@ queue_coverage <- function(db_path) {
   }
   if (!is.null(sub)) {
     out$queue_submissions <- list(rows = as.integer(sub$n), min = sub$lo, max = sub$hi)
+  }
+  present <- DBI::dbListTables(con)
+  for (tbl in intersect(names(APPEND_ONLY_TABLES), present)) {
+    col <- APPEND_ONLY_TABLES[[tbl]]
+    r <- DBI::dbGetQuery(con, sprintf(
+      'SELECT COUNT(*) AS n, MIN("%s") AS lo, MAX("%s") AS hi FROM "%s"', col, col, tbl))
+    out[[tbl]] <- list(rows = as.integer(r$n), min = r$lo, max = r$hi)
   }
   out
 }
@@ -523,6 +537,20 @@ retention_violations <- function(now, prior) {
       now$queue_history_daily$min > day_min) {
     out <- c(out, sprintf("the earliest day in queue_history_daily moved forward from %s to %s",
                           day_min, now$queue_history_daily$min))
+  }
+
+  for (tbl in names(APPEND_ONLY_TABLES)) {
+    was <- prior$coverage[[tbl]]
+    if (is.null(was)) next
+    is_now <- now[[tbl]]
+    now_rows <- if (is.null(is_now)) 0L else is_now$rows
+    if (usable(was$rows) && now_rows < as.integer(was$rows)) {
+      out <- c(out, sprintf("%s fell from %d rows to %d", tbl, as.integer(was$rows), now_rows))
+    }
+    if (usable(was$min) && usable(is_now$min) && is_now$min > was$min) {
+      out <- c(out, sprintf("the earliest %s.%s moved forward from %s to %s",
+                            tbl, APPEND_ONLY_TABLES[[tbl]], was$min, is_now$min))
+    }
   }
 
   out
@@ -653,4 +681,304 @@ write_manifest <- function(path, core,
   json <- jsonlite::toJSON(obj, auto_unbox = TRUE, pretty = TRUE, null = "null")
   writeLines(json, path)
   invisible(path)
+}
+
+# --- CRAN incoming listings ---------------------------------------------------
+
+#' Subfolder names from the incoming index, as the hourly scrape reads them.
+#'
+#' `archive` stays excluded: scraped hourly, its four-week listing would land in
+#' queue_snapshots on every run and be charted and counted as a queue folder.
+#' read_archive_folder() reads it once a UTC day into its own tables instead.
+parse_folders <- function(html) {
+  # Match href="foldername/" links (directories end with /)
+  m <- gregexpr('href="([^"]+/)"', html)
+  matches <- regmatches(html, m)[[1]]
+  # Extract folder names (strip href=" and /")
+  folders <- sub('href="', '', matches)
+  folders <- sub('/"$', '', folders)
+  # Exclude parent directory link and "archive"
+  folders <- folders[!folders %in% c("..", ".", "archive")]
+  # Also exclude any absolute paths
+  folders <- folders[!grepl("^/", folders)]
+  folders
+}
+
+#' TRUE when `html` is Apache's index page for /incoming/<path>. An error page
+#' served with a 200 must never read as an empty folder.
+is_incoming_index <- function(html, path) {
+  grepl(sprintf("<title>Index of /incoming/%s</title>", path), html, fixed = TRUE)
+}
+
+#' A size as CRAN's directory index writes it ("4.7K", "901K", "6.1M") in
+#' kilobytes; a bare number is bytes. Copied from cran-feed's parse_size_kb so
+#' the figure matches package_version_history.size_kb.
+parse_size_kb <- function(s) {
+  s <- trimws(s)
+  if (grepl("M$", s)) return(as.numeric(sub("M$", "", s)) * 1024)
+  if (grepl("K$", s)) return(as.numeric(sub("K$", "", s)))
+  as.numeric(s) / 1024
+}
+
+#' Parse CRAN's incoming/archive/ listing.
+#'
+#' Returns package, version, mtime and size_kb, one row per tarball; a
+#' zero-row frame when the index lists none; NULL when the page is not the
+#' archive index. mtime is kept as listed, on CRAN's clock (Europe/Vienna),
+#' the same clock as queue_snapshots.submitted_at. A name that does not split
+#' gets version 'NA', as queue_submissions does, so the key never holds NULL.
+parse_archive_listing <- function(html) {
+  if (!is_incoming_index(html, "archive")) return(NULL)
+  lines <- unlist(strsplit(html, "\n", fixed = TRUE))
+  pattern <- paste0('<a href="([^"/]+\\.tar\\.gz)">[^<]*</a>',
+                    '.*?(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2})\\s*</td>',
+                    '\\s*<td[^>]*>\\s*([0-9.]+[KMG]?)\\s*</td>')
+  m <- regmatches(lines, regexec(pattern, lines, perl = TRUE))
+  m <- m[lengths(m) == 4L]
+  if (length(m) == 0L) {
+    return(data.frame(package = character(0), version = character(0),
+                      mtime = character(0), size_kb = numeric(0),
+                      stringsAsFactors = FALSE))
+  }
+  stem <- sub("\\.tar\\.gz$", "", vapply(m, `[`, "", 2L))
+  splits <- grepl("^.+_[^_]+$", stem)
+  data.frame(
+    package = ifelse(splits, sub("_[^_]+$", "", stem), stem),
+    version = ifelse(splits, sub("^.+_", "", stem), "NA"),
+    mtime   = vapply(m, `[`, "", 3L),
+    size_kb = round(vapply(vapply(m, `[`, "", 4L), parse_size_kb, 0), 1),
+    stringsAsFactors = FALSE)
+}
+
+# --- CRAN incoming/archive/ episodes ------------------------------------------
+
+#' Create the two archive tables. One episode per archived file, keyed with
+#' mtime because one version is often uploaded more than once; one read row per
+#' daily read, which tells "left the folder" from "not read" and marks the
+#' first_seen values that are only when reading began.
+ensure_archive_tables <- function(con) {
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS queue_archive_episodes (
+      package TEXT NOT NULL, version TEXT NOT NULL,
+      mtime TEXT NOT NULL,          -- as listed, Europe/Vienna
+      size_kb REAL,
+      first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,  -- UTC snapshot_time
+      PRIMARY KEY (package, version, mtime)) WITHOUT ROWID")
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_qae_first_seen ON queue_archive_episodes(first_seen)")
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS queue_archive_reads (
+      read_at TEXT PRIMARY KEY, listed INTEGER NOT NULL)")
+  invisible(NULL)
+}
+
+#' TRUE when no archive read falls on the UTC date of `snapshot_time`.
+archive_read_due <- function(con, snapshot_time) {
+  if (!"queue_archive_reads" %in% DBI::dbListTables(con)) return(TRUE)
+  n <- DBI::dbGetQuery(con,
+    "SELECT COUNT(*) AS n FROM queue_archive_reads WHERE substr(read_at, 1, 10) = ?",
+    params = list(substr(as.character(snapshot_time), 1L, 10L)))$n
+  n == 0L
+}
+
+#' Record one read of the archive listing: upsert every listed file and write
+#' the read row, in one transaction.
+#'
+#' Refuses a zero-row listing when the previous read listed files, so a changed
+#' page layout cannot end every open episode at once; it warns and writes
+#' nothing, and the next run that day reads again.
+#'
+#' Returns the number of new episodes, or NA when refused.
+record_archive_read <- function(con, entries, read_at) {
+  ensure_archive_tables(con)
+  read_at <- as.character(read_at)
+  prev <- DBI::dbGetQuery(con,
+    "SELECT listed FROM queue_archive_reads ORDER BY read_at DESC LIMIT 1")$listed
+  if (nrow(entries) == 0L && length(prev) == 1L && prev > 0L) {
+    cat(sprintf("::warning::incoming/archive/ listed no files after a read that listed %d; not recorded\n",
+                prev))
+    return(NA_integer_)
+  }
+  count <- function() DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM queue_archive_episodes")$n
+  DBI::dbWithTransaction(con, {
+    before <- count()
+    DBI::dbExecute(con, "INSERT OR REPLACE INTO queue_archive_reads (read_at, listed) VALUES (?, ?)",
+                   params = list(read_at, nrow(entries)))
+    if (nrow(entries) > 0L) {
+      DBI::dbExecute(con, "
+        INSERT INTO queue_archive_episodes
+          (package, version, mtime, size_kb, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (package, version, mtime)
+          DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
+        params = list(entries$package, entries$version, entries$mtime,
+                      entries$size_kb, rep(read_at, nrow(entries)),
+                      rep(read_at, nrow(entries))))
+    }
+    as.integer(count() - before)
+  })
+}
+
+#' Read CRAN's incoming/archive/ when this run is the first of its UTC day.
+#'
+#' Never throws: the hourly scrape is the product, so a failed read is logged
+#' and leaves no read row, and the next run that day tries again. `fetch` takes
+#' a URL and returns the page as one string (update.R passes fetch_page).
+#'
+#' Returns list(status, listed, new); status is "not_due", "ok", "failed",
+#' "not_index" or "refused".
+read_archive_folder <- function(con, snapshot_time, fetch, base_url) {
+  tryCatch({
+    if (!archive_read_due(con, snapshot_time)) {
+      list(status = "not_due", listed = NA_integer_, new = NA_integer_)
+    } else {
+      entries <- parse_archive_listing(fetch(paste0(base_url, "archive/")))
+      if (is.null(entries)) {
+        cat("  Archive read failed: the page is not the archive index\n")
+        list(status = "not_index", listed = NA_integer_, new = NA_integer_)
+      } else {
+        new <- record_archive_read(con, entries, snapshot_time)
+        list(status = if (is.na(new)) "refused" else "ok",
+             listed = nrow(entries), new = new)
+      }
+    }
+  }, error = function(e) {
+    cat("  Archive read failed:", conditionMessage(e), "\n")
+    list(status = "failed", listed = NA_integer_, new = NA_integer_)
+  })
+}
+
+#' The release-notes line for this run's archive read, "" when none was due.
+archive_notes_line <- function(read) {
+  switch(read$status,
+    not_due = "",
+    ok      = sprintf("**Archive folder:** %d listed, %d new\n\n", read$listed, read$new),
+    refused = "**Archive folder:** listed nothing after a non-empty read; not recorded, the next run today reads again\n\n",
+    "**Archive folder:** not read; the next run today tries again\n\n")
+}
+
+# --- Per-folder reads of the hourly scrape ------------------------------------
+
+#' Parse the .tar.gz rows of one incoming subfolder page.
+parse_entries <- function(html, folder) {
+  # Apache mod_autoindex table format:
+  # <td><a href="Pkg_1.0.tar.gz">Pkg_1.0.tar.gz</a></td><td align="right">2026-03-09 14:28  </td>
+  # We split by lines and parse each
+  lines <- unlist(strsplit(html, "\n"))
+
+  # Pattern: anchor with .tar.gz, then non-digit chars (closing tags), then date+time
+  pattern <- '<a href="([^"]+\\.tar\\.gz)">[^<]+</a>[^0-9]*(\\d{4}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2})'
+
+  results <- list()
+  for (line in lines) {
+    m <- regmatches(line, regexec(pattern, line))[[1]]
+    if (length(m) == 4) {
+      filename <- m[2]
+      date_str <- m[3]
+      time_str <- m[4]
+      submitted_at <- paste0(date_str, " ", time_str)
+
+      # Parse package name and version from filename
+      # Pattern: PackageName_Version.tar.gz
+      pkg_match <- regmatches(filename, regexec("^(.+)_([^_]+)\\.tar\\.gz$", filename))[[1]]
+      if (length(pkg_match) == 3) {
+        pkg_name <- pkg_match[2]
+        pkg_version <- pkg_match[3]
+      } else {
+        pkg_name <- sub("\\.tar\\.gz$", "", filename)
+        pkg_version <- NA
+      }
+
+      results[[length(results) + 1]] <- data.frame(
+        package = pkg_name,
+        version = pkg_version,
+        folder = folder,
+        submitted_at = submitted_at,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  if (length(results) > 0) {
+    do.call(rbind, results)
+  } else {
+    data.frame(
+      package = character(0),
+      version = character(0),
+      folder = character(0),
+      submitted_at = character(0),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+#' Read every folder of one scrape.
+#'
+#' Returns list(entries, reads): `entries` holds one data frame per folder
+#' that listed tarballs, as the snapshot insert expects; `reads` has one row
+#' per folder with its outcome ("ok", "error" when the fetch threw,
+#' "not_index" when the page was not that folder's index) and `listed`, the
+#' tarball rows parsed (NA on "error"). A failed folder never stops the scrape.
+scrape_folders <- function(folders, fetch, base_url) {
+  entries <- list()
+  reads <- data.frame(folder = folders,
+                      outcome = rep(NA_character_, length(folders)),
+                      listed = rep(NA_integer_, length(folders)),
+                      stringsAsFactors = FALSE)
+  for (i in seq_along(folders)) {
+    folder <- folders[[i]]
+    cat("Scraping folder:", folder, "...\n")
+    tryCatch({
+      html <- fetch(paste0(base_url, folder, "/"))
+      found <- parse_entries(html, folder)
+      if (nrow(found) > 0) {
+        entries[[length(entries) + 1L]] <- found
+        cat("  Found", nrow(found), "packages\n")
+      } else {
+        cat("  No packages found\n")
+      }
+      reads$outcome[i] <- if (is_incoming_index(html, folder)) "ok" else "not_index"
+      reads$listed[i] <- nrow(found)
+    }, error = function(e) {
+      cat("  Error scraping folder", folder, ":", conditionMessage(e), "\n")
+      reads$outcome[i] <<- "error"
+    })
+  }
+  list(entries = entries, reads = reads)
+}
+
+#' Create queue_folder_reads: one row per folder per scrape.
+ensure_folder_reads <- function(con) {
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS queue_folder_reads (
+      snapshot_time TEXT NOT NULL,
+      folder        TEXT NOT NULL,
+      outcome       TEXT NOT NULL CHECK (outcome IN ('ok', 'error', 'not_index')),
+      listed        INTEGER,
+      PRIMARY KEY (snapshot_time, folder)
+    ) WITHOUT ROWID")
+  invisible(NULL)
+}
+
+#' Record which folders one scrape read and whether each read succeeded.
+#' Keyed on (snapshot_time, folder), so a re-run replaces rather than duplicates.
+record_folder_reads <- function(con, snapshot_time, reads) {
+  ensure_folder_reads(con)
+  n <- nrow(reads)
+  if (n == 0L) return(invisible(0L))
+  DBI::dbWithTransaction(con, DBI::dbExecute(con,
+    "INSERT OR REPLACE INTO queue_folder_reads (snapshot_time, folder, outcome, listed)
+     VALUES (?, ?, ?, ?)",
+    params = list(rep(as.character(snapshot_time), n), reads$folder, reads$outcome,
+                  as.integer(reads$listed))))
+  invisible(n)
+}
+
+#' The release-notes line naming the folders a scrape did not read, "" when
+#' every folder was read.
+folder_reads_notes_line <- function(reads) {
+  failed <- reads[reads$outcome != "ok", , drop = FALSE]
+  if (nrow(failed) == 0L) return("")
+  sprintf("**Folders not read:** %s\n\n",
+          paste0(failed$folder, " (", failed$outcome, ")", collapse = ", "))
 }
