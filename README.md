@@ -2,21 +2,25 @@
 
 Automated snapshots of the [CRAN incoming queue](https://cran.r-project.org/incoming/) taken every hour. Each snapshot records every package currently sitting in one of the incoming subfolders (inspect, pending, pretest, publish, recheck, waiting, etc.), capturing how long packages wait before appearing on CRAN.
 
-The data is stored in a SQLite database (`queue.db`) and published as a GitHub release.
+The data is stored in a SQLite database (`queue.db`) and published as a GitHub release, compressed with zstd as `queue.db.zst`, beside a `manifest.json` that gives the size and sha256 of both files. New releases no longer carry the plain `queue.db`; older releases keep it.
 
 ## Data Access
+
+Each example downloads the latest release and decompresses it to `queue.db`.
 
 ### CLI
 
 ```bash
-gh release download latest --repo r-observatory/cran-queue --pattern "queue.db"
+gh release download --repo r-observatory/cran-queue --pattern "queue.db.zst"
+zstd -d queue.db.zst -o queue.db
 ```
 
 ### R
 
 ```r
-url <- "https://github.com/r-observatory/cran-queue/releases/latest/download/queue.db"
-download.file(url, "queue.db", mode = "wb")
+url <- "https://github.com/r-observatory/cran-queue/releases/latest/download/queue.db.zst"
+download.file(url, "queue.db.zst", mode = "wb")
+system2("zstd", c("-d", "-f", "queue.db.zst", "-o", "queue.db"))  # needs the zstd command
 
 library(RSQLite)
 con <- dbConnect(SQLite(), "queue.db")
@@ -28,11 +32,15 @@ dbDisconnect(con)
 ### Python
 
 ```python
-import urllib.request
+import shutil
 import sqlite3
+import urllib.request
+from compression import zstd  # Python 3.14+; on older versions use the zstandard package
 
-url = "https://github.com/r-observatory/cran-queue/releases/latest/download/queue.db"
-urllib.request.urlretrieve(url, "queue.db")
+url = "https://github.com/r-observatory/cran-queue/releases/latest/download/queue.db.zst"
+urllib.request.urlretrieve(url, "queue.db.zst")
+with zstd.open("queue.db.zst") as src, open("queue.db", "wb") as dst:
+    shutil.copyfileobj(src, dst)
 
 con = sqlite3.connect("queue.db")
 cur = con.cursor()

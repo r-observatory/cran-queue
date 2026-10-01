@@ -620,6 +620,22 @@ asset_size_warnings <- function(sizes, max_bytes = RELEASE_ASSET_MAX_BYTES,
           names(near), 100 * as.numeric(near) / max_bytes, as.numeric(near), max_bytes)
 }
 
+#' Bytes of each file a release uploads, keyed by filename, for the cap check.
+#' The plain queue.db is not uploaded, so it is not held to the cap.
+published_asset_sizes <- function(zst_path) {
+  stats::setNames(file.size(zst_path), basename(zst_path))
+}
+
+#' The paragraph every release's notes end with, for readers who used the
+#' plain queue.db URL.
+release_asset_note <- function() {
+  paste0(
+    "### Download\n\n",
+    "This release carries `queue.db.zst` and `manifest.json`. The plain `queue.db` ",
+    "is no longer attached to new releases; older releases keep it. ",
+    "Decompress with `zstd -d queue.db.zst`.\n")
+}
+
 #' Build the integrity / completeness core describing a finalized SQLite file.
 #'
 #' Returns a named list of TOP-LEVEL manifest fields computed from the exact
