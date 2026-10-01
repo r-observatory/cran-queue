@@ -415,6 +415,12 @@ update_submissions <- function(con, snapshot_time = NULL) {
   as.integer(n)
 }
 
+# Tables that are only ever added to, each with the column that dates its rows.
+# Their rows can never fall, their earliest date can never move later, and one
+# that vanished counts as zero rows. None can be rebuilt from anything else.
+APPEND_ONLY_TABLES <- c(queue_archive_episodes = "first_seen",
+                        queue_archive_reads    = "read_at")
+
 #' How far back each accumulating table reaches, not just how big it is.
 #'
 #' Recorded in the manifest so the NEXT run can check it did not lose anything.
@@ -453,6 +459,13 @@ queue_coverage <- function(db_path) {
   }
   if (!is.null(sub)) {
     out$queue_submissions <- list(rows = as.integer(sub$n), min = sub$lo, max = sub$hi)
+  }
+  present <- DBI::dbListTables(con)
+  for (tbl in intersect(names(APPEND_ONLY_TABLES), present)) {
+    col <- APPEND_ONLY_TABLES[[tbl]]
+    r <- DBI::dbGetQuery(con, sprintf(
+      'SELECT COUNT(*) AS n, MIN("%s") AS lo, MAX("%s") AS hi FROM "%s"', col, col, tbl))
+    out[[tbl]] <- list(rows = as.integer(r$n), min = r$lo, max = r$hi)
   }
   out
 }
@@ -523,6 +536,20 @@ retention_violations <- function(now, prior) {
       now$queue_history_daily$min > day_min) {
     out <- c(out, sprintf("the earliest day in queue_history_daily moved forward from %s to %s",
                           day_min, now$queue_history_daily$min))
+  }
+
+  for (tbl in names(APPEND_ONLY_TABLES)) {
+    was <- prior$coverage[[tbl]]
+    if (is.null(was)) next
+    is_now <- now[[tbl]]
+    now_rows <- if (is.null(is_now)) 0L else is_now$rows
+    if (usable(was$rows) && now_rows < as.integer(was$rows)) {
+      out <- c(out, sprintf("%s fell from %d rows to %d", tbl, as.integer(was$rows), now_rows))
+    }
+    if (usable(was$min) && usable(is_now$min) && is_now$min > was$min) {
+      out <- c(out, sprintf("the earliest %s.%s moved forward from %s to %s",
+                            tbl, APPEND_ONLY_TABLES[[tbl]], was$min, is_now$min))
+    }
   }
 
   out
