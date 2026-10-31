@@ -53,11 +53,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
-          if [ -z "$tag" ]; then
+          # The lookup has to fail the same way the download does. On 2026-10-03
+          # `gh release view ... 2>/dev/null || true` returned nothing for a
+          # transient API error, that read as "no releases yet", and the run
+          # published a fresh database over 3,664,194 snapshots. So gh runs only
+          # in plain assignments, where an API error fails the job under set -e,
+          # and a fresh start needs a release list that came back empty, as in
+          # cran-metadata (7b27537).
+          releases="$(gh release list --limit 1 --exclude-drafts)"
+          if [ -z "$releases" ]; then
             echo "No releases exist yet; starting fresh."
             exit 0
           fi
+          tag="$(gh release view --json tagName -q .tagName)"
           echo "Previous release: $tag"
 
           # A missing asset and a failed download look the same to `gh release
@@ -65,7 +73,7 @@ jobs:
           # to pull anything. Otherwise a compressed-only release and a network
           # failure would be indistinguishable, which is the confusion that
           # caused the 07-16 loss in the first place.
-          assets="$(gh release view "$tag" --json assets -q '.assets[].name' 2>/dev/null || true)"
+          assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
           if printf '%s\n' "$assets" | grep -qx 'queue.db.zst'; then
             want="queue.db.zst"
           elif printf '%s\n' "$assets" | grep -qx 'queue.db'; then
@@ -105,9 +113,14 @@ jobs:
           # The manifest states what that release contained, and update.R holds
           # this run to it before publishing. Releases predating the manifest do
           # not have one, so its absence is not an error; a run with nothing to
-          # compare against says so and carries on.
-          gh release download "$tag" --pattern "manifest.json" --clobber \
-            || echo "::warning::${tag} has no manifest.json; this run cannot be checked against it"
+          # compare against says so and carries on. A release that lists one must
+          # hand it over, though: without it the retention check passes vacuously,
+          # which is how the 10-03 reset went out green.
+          if printf '%s\n' "$assets" | grep -qx 'manifest.json'; then
+            gh release download "$tag" --pattern "manifest.json" --clobber
+          else
+            echo "::warning::${tag} has no manifest.json; this run cannot be checked against it"
+          fi
 
       - name: Import historical data (if needed)
         run: Rscript scripts/import-history.R queue.db
