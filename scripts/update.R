@@ -250,16 +250,20 @@ cat(sprintf("Retention OK: %d snapshots from %s, %d days of history from %s\n",
             coverage$queue_history_daily$dates, coverage$queue_history_daily$min))
 
 
-# --- Build the published asset, and refuse to publish one that cannot upload ---
-# Compressing is what lets the history keep growing without ever being trimmed
-# to fit: the database is about nine times its compressed size, and a release
-# goes out every hour. Only the compressed file is uploaded.
-zst_path <- compress_asset(db_path)
-asset_sizes <- published_asset_sizes(zst_path)
-cat(sprintf("Asset: %s %.1f MB -> %s %.1f MB (%.1fx smaller)\n",
-            basename(db_path), file.size(db_path) / 1024^2,
-            basename(zst_path), asset_sizes[[1]] / 1024^2,
-            file.size(db_path) / asset_sizes[[1]]))
+# --- Split into the parts the releases carry, and refuse any that cannot upload ---
+# Closed years go once into their own history-YYYY releases; this run's release
+# carries only the current year and the small tables (see build_layout()).
+# Only compressed files are uploaded.
+layout <- build_layout(db_path, as.integer(substr(snapshot_time, 1L, 4L)), prior_manifest)
+new_paths <- vapply(layout$new_parts, function(p) p$path, character(1))
+asset_sizes <- published_asset_sizes(c(layout$current_zst, new_paths))
+cat(sprintf("Current part: %s %.1f MB -> %s %.1f MB\n",
+            basename(layout$current_db), file.size(layout$current_db) / 1024^2,
+            basename(layout$current_zst), file.size(layout$current_zst) / 1024^2))
+for (p in layout$parts) {
+  cat(sprintf("History %d: %s in %s, %d rows%s\n", as.integer(p$year), p$asset, p$tag,
+              as.integer(p$rows), if (p$tag %in% vapply(layout$new_parts, function(n) n$tag, "")) " (new)" else ""))
+}
 
 oversized <- asset_size_violations(asset_sizes)
 if (length(oversized) > 0) {
@@ -270,13 +274,19 @@ if (length(oversized) > 0) {
 }
 for (w in asset_size_warnings(asset_sizes)) cat("NOTE:", w, "\n")
 
+# The integrity fields describe the current part a consumer downloads from this
+# release; coverage describes the whole history the parts add up to, which is
+# what the next run is held to.
 complete <- queue_history_complete(db_path)
-core <- summary_integrity_core(db_path, complete = complete)
+core <- summary_integrity_core(layout$current_db, complete = complete)
+core$layout <- "yearly"
 core$coverage <- coverage
-core <- c(core, compressed_asset_core(zst_path))
+core <- c(core, compressed_asset_core(layout$current_zst))
+core$parts <- layout$parts
 manifest_path <- file.path(dirname(db_path), MANIFEST_FILENAME)
 write_manifest(manifest_path, core)
-cat(sprintf("Wrote %s (complete=%s, db_bytes=%.0f)\n",
-            manifest_path, complete, core$db_bytes))
+write_new_parts(file.path(dirname(db_path), "new-parts.tsv"), layout$new_parts)
+cat(sprintf("Wrote %s (complete=%s, %d history parts, %d new)\n",
+            manifest_path, complete, length(layout$parts), length(layout$new_parts)))
 
 cat("Done.\n")

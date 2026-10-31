@@ -2,28 +2,46 @@
 
 Automated snapshots of the [CRAN incoming queue](https://cran.r-project.org/incoming/) taken every hour. Each snapshot records every package currently sitting in one of the incoming subfolders (inspect, pending, pretest, publish, recheck, waiting, etc.), capturing how long packages wait before appearing on CRAN.
 
-The data is stored in a SQLite database (`queue.db`) and published as a GitHub release, compressed with zstd as `queue.db.zst`, beside a `manifest.json` that gives the size and sha256 of both files. New releases no longer carry the plain `queue.db`; older releases keep it.
+The data is stored in a SQLite database (`queue.db`) and published in GitHub releases, split by year and compressed with zstd:
+
+- Every hourly release carries `queue-current.db.zst`, this year's `queue_snapshots` rows plus every other table whole, beside a `manifest.json` that gives the size and sha256 of each file and lists the history parts.
+- Each closed year of `queue_snapshots` is in its own release, `history-YYYY`, as `queue-YYYY.db.zst`. A year's part is written once, by the first run after the year ends, and never changes. Rows keep their ids from the full database.
+
+So one year of snapshots never needs more than one download, and nothing re-uploads history that cannot change. Releases from before the split (until 2026-10-31) carry the whole history as one `queue.db.zst`, and older ones a plain `queue.db`. For every table of every pipeline in one file, use `observatory.db` from [r-observatory/data](https://github.com/r-observatory/data).
 
 ## Data Access
 
-Each example downloads the latest release and decompresses it to `queue.db`.
+Each example downloads the latest release, then the history parts its manifest lists, and puts them together in `queue.db`. Skip the parts loop if you only need the current year.
 
 ### CLI
 
 ```bash
-gh release download --repo r-observatory/cran-queue --pattern "queue.db.zst"
-zstd -d queue.db.zst -o queue.db
+gh release download --repo r-observatory/cran-queue --pattern "queue-current.db.zst" --pattern "manifest.json"
+zstd -d queue-current.db.zst -o queue.db
+jq -r '.parts[] | "\(.tag) \(.asset)"' manifest.json | while read -r tag asset; do
+  gh release download "$tag" --repo r-observatory/cran-queue --pattern "$asset"
+  zstd -d -f "$asset" -o part.db
+  sqlite3 queue.db "ATTACH 'part.db' AS p; INSERT INTO queue_snapshots SELECT * FROM p.queue_snapshots; DETACH p;"
+done
 ```
 
 ### R
 
 ```r
-url <- "https://github.com/r-observatory/cran-queue/releases/latest/download/queue.db.zst"
-download.file(url, "queue.db.zst", mode = "wb")
-system2("zstd", c("-d", "-f", "queue.db.zst", "-o", "queue.db"))  # needs the zstd command
+base <- "https://github.com/r-observatory/cran-queue/releases"
+download.file(file.path(base, "latest/download/queue-current.db.zst"), "queue-current.db.zst", mode = "wb")
+download.file(file.path(base, "latest/download/manifest.json"), "manifest.json", mode = "wb")
+system2("zstd", c("-d", "-f", "queue-current.db.zst", "-o", "queue.db"))  # needs the zstd command
 
 library(RSQLite)
 con <- dbConnect(SQLite(), "queue.db")
+for (p in jsonlite::fromJSON("manifest.json", simplifyVector = FALSE)$parts) {
+  download.file(file.path(base, "download", p$tag, p$asset), p$asset, mode = "wb")
+  system2("zstd", c("-d", "-f", p$asset, "-o", "part.db"))
+  dbExecute(con, "ATTACH 'part.db' AS p")
+  dbExecute(con, "INSERT INTO queue_snapshots SELECT * FROM p.queue_snapshots")
+  dbExecute(con, "DETACH p")
+}
 snapshots <- dbReadTable(con, "queue_snapshots")
 stats <- dbReadTable(con, "queue_stats")
 dbDisconnect(con)
@@ -32,20 +50,30 @@ dbDisconnect(con)
 ### Python
 
 ```python
+import json
 import shutil
 import sqlite3
 import urllib.request
 from compression import zstd  # Python 3.14+; on older versions use the zstandard package
 
-url = "https://github.com/r-observatory/cran-queue/releases/latest/download/queue.db.zst"
-urllib.request.urlretrieve(url, "queue.db.zst")
-with zstd.open("queue.db.zst") as src, open("queue.db", "wb") as dst:
-    shutil.copyfileobj(src, dst)
+base = "https://github.com/r-observatory/cran-queue/releases"
+
+def fetch(url, compressed, out):
+    urllib.request.urlretrieve(url, compressed)
+    with zstd.open(compressed) as src, open(out, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+fetch(f"{base}/latest/download/queue-current.db.zst", "queue-current.db.zst", "queue.db")
+urllib.request.urlretrieve(f"{base}/latest/download/manifest.json", "manifest.json")
 
 con = sqlite3.connect("queue.db")
-cur = con.cursor()
-cur.execute("SELECT * FROM queue_snapshots LIMIT 10")
-print(cur.fetchall())
+for part in json.load(open("manifest.json"))["parts"]:
+    fetch(f"{base}/download/{part['tag']}/{part['asset']}", part["asset"], "part.db")
+    con.execute("ATTACH 'part.db' AS p")
+    con.execute("INSERT INTO queue_snapshots SELECT * FROM p.queue_snapshots")
+    con.commit()
+    con.execute("DETACH p")
+print(con.execute("SELECT COUNT(*), MIN(snapshot_time) FROM queue_snapshots").fetchone())
 con.close()
 ```
 
@@ -109,7 +137,7 @@ One row per folder per scrape. Scrapes before this table was added have no rows.
 
 ## Update Schedule
 
-The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The first run of each UTC day also reads `incoming/archive/` into `queue_archive_episodes`. The latest database is always available from the most recent GitHub release. A `last-updated.txt` file in the repo tracks the last successful run time.
+The database is updated every hour via GitHub Actions. Each run scrapes the current state of the CRAN incoming queue and appends a new snapshot. The first run of each UTC day also reads `incoming/archive/` into `queue_archive_episodes`. The most recent GitHub release always carries the current year and a manifest naming the `history-YYYY` releases that hold the rest; each run downloads all of them and works on the full history. A `last-updated.txt` file in the repo tracks the last successful run time.
 
 ## License
 
