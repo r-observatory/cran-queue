@@ -627,13 +627,206 @@ published_asset_sizes <- function(zst_path) {
 }
 
 #' The paragraph every release's notes end with, for readers who used the
-#' plain queue.db URL.
+#' single-file queue.db.zst URL.
 release_asset_note <- function() {
   paste0(
     "### Download\n\n",
-    "This release carries `queue.db.zst` and `manifest.json`. The plain `queue.db` ",
-    "is no longer attached to new releases; older releases keep it. ",
-    "Decompress with `zstd -d queue.db.zst`.\n")
+    "This release carries `queue-current.db.zst` (this year's snapshots and every ",
+    "other table) and `manifest.json`. Earlier years of `queue_snapshots` are in ",
+    "the `history-YYYY` releases the manifest lists, one `queue-YYYY.db.zst` each; ",
+    "the README shows how to put them back together. Releases before the split ",
+    "carry the whole history as one `queue.db.zst`. ",
+    "Decompress with `zstd -d queue-current.db.zst`.\n")
+}
+
+# --- Yearly parts ---------------------------------------------------------------
+
+# queue_snapshots only ever grows by the current scrape, so a closed year never
+# changes, yet every hourly release used to re-upload all of them. Each closed
+# year now goes once into its own release, history-YYYY, as queue-YYYY.db.zst:
+# that year's queue_snapshots rows with their original ids. Every run's release
+# carries queue-current.db.zst, the current year's snapshots and every other
+# table whole, and its manifest lists the parts. A run starts by putting them
+# back together, so update.R always works on the full history and the
+# retention check still measures all of it.
+#
+# Ids are kept, not renumbered, because they are not in time order: the raw
+# cransays history was imported after the live scrape began, so 2026's rows hold
+# the lowest ids. submissions_query() breaks ties within a scrape on rowid, and
+# kept ids keep those answers identical across the split.
+
+CURRENT_PART <- "queue-current.db"
+
+#' Release tag and file name for one closed year.
+part_tag <- function(year) sprintf("history-%d", as.integer(year))
+part_file <- function(year) sprintf("queue-%d.db", as.integer(year))
+
+#' The [start, end) snapshot_time strings of a calendar year.
+year_bounds <- function(year) {
+  c(sprintf("%d-01-01", as.integer(year)), sprintf("%d-01-01", as.integer(year) + 1L))
+}
+
+#' Calendar years present in queue_snapshots, ascending.
+snapshot_years <- function(con) {
+  y <- DBI::dbGetQuery(con, "
+    SELECT DISTINCT substr(snapshot_time, 1, 4) AS y FROM queue_snapshots ORDER BY y")$y
+  as.integer(y)
+}
+
+#' Rows and reach of one year of queue_snapshots.
+year_stats <- function(con, year) {
+  r <- DBI::dbGetQuery(con, "
+    SELECT COUNT(*) AS n, MIN(snapshot_time) AS lo, MAX(snapshot_time) AS hi
+      FROM queue_snapshots WHERE snapshot_time >= ? AND snapshot_time < ?",
+    params = as.list(year_bounds(year)))
+  list(rows = as.integer(r$n), min = r$lo, max = r$hi)
+}
+
+#' Write one year of queue_snapshots, ids kept, to a new database at out_path.
+#' No indexes: the part is a transport format, and the database it is
+#' assembled into already has them. Returns the number of rows written.
+export_year <- function(db_path, year, out_path) {
+  stopifnot(file.exists(db_path), !file.exists(out_path))
+  con <- DBI::dbConnect(RSQLite::SQLite(), out_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbExecute(con, "
+    CREATE TABLE queue_snapshots (
+      id INTEGER PRIMARY KEY,
+      snapshot_time TEXT NOT NULL,
+      package TEXT NOT NULL,
+      version TEXT,
+      folder TEXT NOT NULL,
+      submitted_at TEXT
+    )")
+  DBI::dbExecute(con, sprintf("ATTACH %s AS src", DBI::dbQuoteString(con, db_path)))
+  n <- DBI::dbExecute(con, "
+    INSERT INTO queue_snapshots (id, snapshot_time, package, version, folder, submitted_at)
+    SELECT id, snapshot_time, package, version, folder, submitted_at
+      FROM src.queue_snapshots
+     WHERE snapshot_time >= ? AND snapshot_time < ?
+     ORDER BY id", params = as.list(year_bounds(year)))
+  DBI::dbExecute(con, "DETACH src")
+  invisible(as.integer(n))
+}
+
+#' Copy the database without the snapshots of closed years. Every other table,
+#' the indexes and the id sequence stay, so the copy is the current part.
+export_current <- function(db_path, out_path, current_year) {
+  stopifnot(file.exists(db_path), !file.exists(out_path), file.copy(db_path, out_path))
+  con <- DBI::dbConnect(RSQLite::SQLite(), out_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbExecute(con, "PRAGMA journal_mode=DELETE")
+  DBI::dbExecute(con, "DELETE FROM queue_snapshots WHERE snapshot_time < ?",
+                 params = list(year_bounds(current_year)[[1]]))
+  DBI::dbExecute(con, "VACUUM")
+  invisible(out_path)
+}
+
+#' Split a finished database into the files this run publishes.
+#'
+#' A closed year the previous release already lists keeps its part as
+#' published, after checking the year still matches it row for row; a closed
+#' year without one gets a new part, which happens once per year, the first
+#' time a run finds it closed. Returns the current part (database and .zst),
+#' every part for the manifest, and the new parts this run must publish.
+build_layout <- function(db_path, current_year, prior, out_dir = dirname(db_path)) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), db_path)
+  years <- snapshot_years(con)
+  closed <- years[years < current_year]
+  stats <- lapply(closed, function(y) year_stats(con, y))
+  DBI::dbDisconnect(con)
+
+  known <- list()
+  for (p in prior$parts) known[[as.character(p$year)]] <- p
+  lost <- setdiff(as.integer(names(known)), closed)
+  if (length(lost) > 0L) {
+    stop(sprintf("the previous release lists history for %s, which this database no longer has",
+                 paste(sort(lost), collapse = ", ")))
+  }
+
+  parts <- list()
+  new_parts <- list()
+  for (i in seq_along(closed)) {
+    y <- closed[[i]]
+    s <- stats[[i]]
+    p <- known[[as.character(y)]]
+    if (!is.null(p)) {
+      if (!identical(as.integer(p$rows), s$rows) || !identical(p$min, s$min) ||
+          !identical(p$max, s$max)) {
+        stop(sprintf("closed year %d no longer matches %s: published %d rows %s to %s, now %d rows %s to %s",
+                     y, p$tag, as.integer(p$rows), p$min, p$max, s$rows, s$min, s$max))
+      }
+      parts[[length(parts) + 1L]] <- p
+      next
+    }
+    db <- file.path(out_dir, part_file(y))
+    unlink(c(db, paste0(db, ".zst")))
+    export_year(db_path, y, db)
+    zst <- compress_asset(db)
+    p <- list(year = y, tag = part_tag(y), asset = basename(zst),
+              asset_bytes = file.size(zst), asset_sha256 = file_sha256(zst),
+              db_bytes = file.size(db), db_sha256 = file_sha256(db),
+              rows = s$rows, min = s$min, max = s$max)
+    parts[[length(parts) + 1L]] <- p
+    new_parts[[length(new_parts) + 1L]] <- c(p, list(path = zst))
+  }
+
+  current_db <- file.path(out_dir, CURRENT_PART)
+  unlink(c(current_db, paste0(current_db, ".zst")))
+  export_current(db_path, current_db, current_year)
+  list(current_db = current_db, current_zst = compress_asset(current_db),
+       parts = parts, new_parts = new_parts)
+}
+
+#' The new parts a run has to publish, one tab-separated line each
+#' (year, tag, file, sha256), for scripts/publish.sh.
+write_new_parts <- function(path, new_parts) {
+  lines <- vapply(new_parts, function(p) {
+    paste(p$year, p$tag, p$path, p$asset_sha256, sep = "\t")
+  }, character(1))
+  writeLines(lines, path)
+  invisible(path)
+}
+
+#' Insert every part a manifest lists into the database expanded from that
+#' release's queue-current.db.zst.
+#'
+#' Each part must match the manifest's sha256 before and after decompressing
+#' and hold the rows it lists; anything else stops, because a run that went on
+#' would publish a history with a year missing. Returns the rows inserted.
+assemble_parts <- function(db_path, manifest, parts_dir) {
+  parts <- manifest$parts
+  if (length(parts) == 0L) return(invisible(0L))
+  if (!nzchar(Sys.which("zstd"))) stop("zstd not found; cannot expand the history parts")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  total <- 0L
+  for (p in parts) {
+    zst <- file.path(parts_dir, p$asset)
+    if (!file.exists(zst)) stop(sprintf("%s from %s is missing", p$asset, p$tag))
+    if (!identical(file_sha256(zst), p$asset_sha256)) {
+      stop(sprintf("%s from %s does not match the sha256 the manifest lists", p$asset, p$tag))
+    }
+    db <- sub("\\.zst$", "", zst)
+    status <- system2("zstd", c("-dq", "-f", shQuote(zst), "-o", shQuote(db)))
+    if (!identical(status, 0L) || !identical(file_sha256(db), p$db_sha256)) {
+      stop(sprintf("%s from %s did not expand to the database the manifest lists", p$asset, p$tag))
+    }
+    DBI::dbExecute(con, sprintf("ATTACH %s AS part", DBI::dbQuoteString(con, db)))
+    held <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM part.queue_snapshots")$n
+    if (held != as.integer(p$rows)) {
+      DBI::dbExecute(con, "DETACH part")
+      stop(sprintf("%s holds %d rows, the manifest lists %d", p$asset, held, as.integer(p$rows)))
+    }
+    n <- DBI::dbWithTransaction(con, DBI::dbExecute(con, "
+      INSERT INTO main.queue_snapshots (id, snapshot_time, package, version, folder, submitted_at)
+      SELECT id, snapshot_time, package, version, folder, submitted_at
+        FROM part.queue_snapshots ORDER BY id"))
+    DBI::dbExecute(con, "DETACH part")
+    unlink(db)
+    total <- total + as.integer(n)
+  }
+  invisible(total)
 }
 
 #' Build the integrity / completeness core describing a finalized SQLite file.
